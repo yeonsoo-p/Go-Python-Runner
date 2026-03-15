@@ -1,0 +1,28 @@
+{
+  "id": "db_keyvalue",
+  "name": "Key-Value Store",
+  "description": "Read/write operations on the built-in kv table",
+  "params": [
+    {
+      "name": "action",
+      "type": "string",
+      "required": false,
+      "default": "demo",
+      "description": "Action: demo (full lifecycle), list (show all), get (read key), set (write key)"
+    },
+    {
+      "name": "key",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "Key name (for get/set actions)"
+    },
+    {
+      "name": "value",
+      "type": "string",
+      "required": false,
+      "default": "",
+      "description": "Value to store (for set action)"
+    }
+  ]
+}

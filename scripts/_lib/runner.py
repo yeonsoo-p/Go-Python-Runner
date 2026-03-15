@@ -1,0 +1,412 @@
+"""Python helper library for go-python-runner scripts.
+
+Wraps the generated gRPC client, providing a simple API for scripts
+to send output, progress, status, errors, and cache data back to the Go backend.
+"""
+
+from __future__ import annotations
+
+import atexit
+import contextlib
+import importlib
+import os
+import pickle
+import sys
+import threading
+import traceback
+from multiprocessing import shared_memory
+from typing import Any
+
+import grpc
+
+# Ensure _lib dir is importable so `gen` package resolves
+_lib_dir = os.path.dirname(os.path.abspath(__file__))
+if _lib_dir not in sys.path:
+    sys.path.insert(0, _lib_dir)
+
+# Late-import generated code (path must be set first)
+runner_pb2 = importlib.import_module("gen.runner_pb2")
+runner_pb2_grpc = importlib.import_module("gen.runner_pb2_grpc")
+
+# Module-level state
+_stub: Any = None
+_stream: Any = None
+_cache_refs: dict[str, shared_memory.SharedMemory] = {}
+_run_id: str | None = None
+
+
+class _MessageIterator:
+    """Thread-safe iterator that yields ClientMessage objects.
+
+    Used as the request iterator for the bidirectional gRPC stream.
+    """
+
+    def __init__(self) -> None:
+        self._queue: list[Any] = []
+        self._condition = threading.Condition()
+        self._done = False
+
+    def __iter__(self) -> _MessageIterator:
+        return self
+
+    def __next__(self) -> Any:
+        with self._condition:
+            while not self._queue and not self._done:
+                self._condition.wait()
+            if self._queue:
+                return self._queue.pop(0)
+            raise StopIteration
+
+    def put(self, msg: Any) -> None:
+        with self._condition:
+            self._queue.append(msg)
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._done = True
+            self._condition.notify()
+
+
+# Global message iterator for sending messages
+_msg_iter = _MessageIterator()
+
+
+def _send(msg: Any) -> None:
+    """Send a ClientMessage through the gRPC stream."""
+    _msg_iter.put(msg)
+
+
+def connect() -> dict[str, str]:
+    """Connect to the Go gRPC server and establish a bidirectional stream.
+
+    Reads GRPC_ADDRESS and RUN_ID from environment variables.
+    Returns the params dict from the StartRequest.
+    """
+    global _stub, _stream, _run_id
+
+    addr = os.environ.get("GRPC_ADDRESS")
+    if not addr:
+        raise RuntimeError("GRPC_ADDRESS environment variable not set")
+
+    _run_id = os.environ.get("RUN_ID", "unknown")
+
+    channel = grpc.insecure_channel(addr)
+    _stub = runner_pb2_grpc.PythonRunnerStub(channel)
+
+    # Create bidirectional stream with run-id metadata
+    metadata = [("run-id", _run_id)]
+    _stream = _stub.Execute(_msg_iter, metadata=metadata)
+
+    # Wait for StartRequest from Go
+    try:
+        start_msg = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for StartRequest: {e}") from e
+    if not start_msg.HasField("start"):
+        raise RuntimeError(f"Expected StartRequest, got {start_msg}")
+
+    return dict(start_msg.start.params)
+
+
+def output(text: object) -> None:
+    """Send an output message to Go."""
+    _send(runner_pb2.ClientMessage(
+        output=runner_pb2.Output(text=str(text))
+    ))
+
+
+def progress(current: int, total: int, label: str = "") -> None:
+    """Send a progress update to Go."""
+    _send(runner_pb2.ClientMessage(
+        progress=runner_pb2.Progress(
+            current=int(current),
+            total=int(total),
+            label=str(label),
+        )
+    ))
+
+
+def complete() -> None:
+    """Send a completed status to Go and close the stream."""
+    _send(runner_pb2.ClientMessage(
+        status=runner_pb2.Status(state="completed")
+    ))
+    _finish()
+
+
+def fail(message: str, tb: str | None = None) -> None:
+    """Send an error and failed status to Go."""
+    if tb is None:
+        tb = traceback.format_exc()
+    _send(runner_pb2.ClientMessage(
+        error=runner_pb2.Error(message=str(message), traceback=str(tb))
+    ))
+    _send(runner_pb2.ClientMessage(
+        status=runner_pb2.Status(state="failed")
+    ))
+    _finish()
+
+
+def _finish() -> None:
+    """Close send stream and block until Go confirms receipt (stream EOF)."""
+    _msg_iter.close()
+    if _stream is None:
+        return
+    # Drain server stream until EOF. Execute() only returns after it has
+    # Recv()'d all our messages, so this guarantees delivery.
+    try:
+        for _ in _stream:
+            pass
+    except grpc.RpcError as e:
+        print(f"[runner] gRPC error during stream drain: {e}", file=sys.stderr)
+
+
+def data_result(key: str, value: bytes) -> None:
+    """Send a data result (binary) to Go."""
+    _send(runner_pb2.ClientMessage(
+        data=runner_pb2.DataResult(key=str(key), value=bytes(value))
+    ))
+
+
+# --- Shared Cache API ---
+
+
+def cache_set(key: str, obj: object) -> None:
+    """Pickle any Python object into a shared memory block and register with Go."""
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    shm = shared_memory.SharedMemory(create=True, size=len(data))
+    if shm.buf is None:
+        raise RuntimeError("SharedMemory buffer is None")
+    shm.buf[:len(data)] = data
+
+    # Store ref before _send so handle isn't orphaned if _send raises
+    _cache_refs[key] = shm
+
+    _send(runner_pb2.ClientMessage(
+        cache_create=runner_pb2.CacheCreate(
+            key=str(key),
+            size=len(data),
+            shm_name=shm.name,
+        )
+    ))
+
+
+def cache_get(key: str) -> object:
+    """Retrieve any Python object from shared memory via Go lookup."""
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
+    # Send lookup request
+    _send(runner_pb2.ClientMessage(
+        cache_lookup=runner_pb2.CacheLookup(key=str(key))
+    ))
+
+    # Wait for CacheInfo response from Go
+    try:
+        resp = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for cache info: {e}") from e
+    if not resp.HasField("cache_info"):
+        raise RuntimeError(f"Expected CacheInfo response, got {resp}")
+
+    info = resp.cache_info
+    if not info.found:
+        raise KeyError(f"Cache key not found: {key}")
+
+    shm = shared_memory.SharedMemory(name=info.shm_name)
+    if shm.buf is None:
+        raise RuntimeError("SharedMemory buffer is None")
+    obj = pickle.loads(bytes(shm.buf[:info.size]))
+    _cache_refs[key] = shm
+    return obj
+
+
+def cache_release(key: str) -> None:
+    """Release local reference to a shared memory block."""
+    if key in _cache_refs:
+        with contextlib.suppress(OSError):
+            _cache_refs[key].close()
+        del _cache_refs[key]
+
+    _send(runner_pb2.ClientMessage(
+        cache_release=runner_pb2.CacheRelease(key=str(key))
+    ))
+
+
+# --- File Dialog API ---
+
+
+def open_file_dialog(
+    title: str = "",
+    directory: str = "",
+    filters: list[tuple[str, str]] | None = None,
+) -> str | None:
+    """Open a native file picker dialog. Blocks until the user selects or cancels.
+
+    Args:
+        title: Dialog window title.
+        directory: Initial directory to show.
+        filters: List of (display_name, pattern) tuples, e.g. [("Text Files", "*.txt")].
+
+    Returns:
+        Absolute file path, or None if the user cancelled.
+    """
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
+    proto_filters = [
+        runner_pb2.FileFilter(display_name=dn, pattern=pat)
+        for dn, pat in (filters or [])
+    ]
+    _send(runner_pb2.ClientMessage(
+        file_dialog=runner_pb2.FileDialogRequest(
+            type="open",
+            title=title,
+            directory=directory,
+            filters=proto_filters,
+        )
+    ))
+    try:
+        resp = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
+    if not resp.HasField("file_dialog_response"):
+        raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+    if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
+        return None
+    return str(resp.file_dialog_response.paths[0])
+
+
+def save_file_dialog(
+    title: str = "",
+    directory: str = "",
+    filename: str = "",
+    filters: list[tuple[str, str]] | None = None,
+) -> str | None:
+    """Open a native save-file dialog. Blocks until the user selects or cancels.
+
+    Args:
+        title: Dialog message text.
+        directory: Initial directory to show.
+        filename: Suggested file name.
+        filters: List of (display_name, pattern) tuples.
+
+    Returns:
+        Absolute file path chosen by the user, or None if cancelled.
+    """
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
+    proto_filters = [
+        runner_pb2.FileFilter(display_name=dn, pattern=pat)
+        for dn, pat in (filters or [])
+    ]
+    _send(runner_pb2.ClientMessage(
+        file_dialog=runner_pb2.FileDialogRequest(
+            type="save",
+            title=title,
+            directory=directory,
+            filename=filename,
+            filters=proto_filters,
+        )
+    ))
+    try:
+        resp = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
+    if not resp.HasField("file_dialog_response"):
+        raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+    if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
+        return None
+    return str(resp.file_dialog_response.paths[0])
+
+
+# --- Database API ---
+
+
+def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
+    """Execute a write SQL statement (INSERT, UPDATE, DELETE, CREATE TABLE, etc.).
+
+    Args:
+        sql: SQL statement with ? placeholders for parameters.
+        params: List of string values for positional ? placeholders.
+
+    Returns:
+        Dict with 'rows_affected' (int) and 'last_insert_id' (int).
+
+    Raises:
+        RuntimeError: If not connected or if the SQL execution fails.
+    """
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
+    _send(runner_pb2.ClientMessage(
+        db_execute=runner_pb2.DbExecute(
+            sql=sql,
+            params=params or [],
+        )
+    ))
+
+    try:
+        resp = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for db result: {e}") from e
+    if not resp.HasField("db_result"):
+        raise RuntimeError(f"Expected DbResult response, got {resp}")
+
+    if resp.db_result.error:
+        raise RuntimeError(f"SQL error: {resp.db_result.error}")
+
+    return {
+        "rows_affected": resp.db_result.rows_affected,
+        "last_insert_id": resp.db_result.last_insert_id,
+    }
+
+
+def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
+    """Execute a read SQL query (SELECT).
+
+    Args:
+        sql: SQL query with ? placeholders for parameters.
+        params: List of string values for positional ? placeholders.
+
+    Returns:
+        List of dicts, one per row, with column names as keys and string values.
+
+    Raises:
+        RuntimeError: If not connected or if the SQL query fails.
+    """
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
+    _send(runner_pb2.ClientMessage(
+        db_query=runner_pb2.DbQuery(
+            sql=sql,
+            params=params or [],
+        )
+    ))
+
+    try:
+        resp = next(_stream)
+    except (StopIteration, grpc.RpcError) as e:
+        raise RuntimeError(f"Lost connection while waiting for db query result: {e}") from e
+    if not resp.HasField("db_query_result"):
+        raise RuntimeError(f"Expected DbQueryResult response, got {resp}")
+
+    if resp.db_query_result.error:
+        raise RuntimeError(f"SQL error: {resp.db_query_result.error}")
+
+    columns = list(resp.db_query_result.columns)
+    return [dict(zip(columns, row.values, strict=False)) for row in resp.db_query_result.rows]
+
+
+def _cleanup_cache() -> None:
+    """Close all shared memory references on exit."""
+    for shm in _cache_refs.values():
+        with contextlib.suppress(OSError):
+            shm.close()
+    _cache_refs.clear()
+
+
+atexit.register(_cleanup_cache)

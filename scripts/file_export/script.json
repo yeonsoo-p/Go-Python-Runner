@@ -1,0 +1,14 @@
+{
+  "id": "file_export",
+  "name": "File Export",
+  "description": "Generates data and saves it to a file chosen via native save dialog",
+  "params": [
+    {
+      "name": "data",
+      "type": "string",
+      "required": false,
+      "default": "hello,world,foo,bar,42",
+      "description": "Comma-separated values to export"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "id": "crash",
+  "name": "Crash Script",
+  "description": "Crashes immediately for testing",
+  "params": []
+}

@@ -1,0 +1,136 @@
+syntax = "proto3";
+package runner;
+option go_package = "go-python-runner/internal/gen";
+
+service PythonRunner {
+  rpc Execute(stream ClientMessage) returns (stream ServerMessage);
+}
+
+// ClientMessage: sent by Python (gRPC client) to Go (gRPC server).
+// Python scripts report their output, progress, status, errors, cache ops, and dialog requests.
+message ClientMessage {
+  oneof msg {
+    Output output = 1;
+    Progress progress = 2;
+    Status status = 3;
+    Error error = 4;
+    DataResult data = 5;
+    CacheCreate cache_create = 6;
+    CacheLookup cache_lookup = 7;
+    CacheRelease cache_release = 8;
+    FileDialogRequest file_dialog = 9;
+    DbExecute db_execute = 10;
+    DbQuery db_query = 11;
+  }
+}
+
+// ServerMessage: sent by Go (gRPC server) to Python (gRPC client).
+// Go sends start params, cancel signals, cache lookup responses, and dialog results.
+message ServerMessage {
+  oneof msg {
+    StartRequest start = 1;
+    CancelRequest cancel = 2;
+    CacheInfo cache_info = 3;
+    FileDialogResponse file_dialog_response = 4;
+    DbResult db_result = 5;
+    DbQueryResult db_query_result = 6;
+  }
+}
+
+message StartRequest {
+  map<string, string> params = 1;
+}
+
+message CancelRequest {}
+
+message Output {
+  string text = 1;
+}
+
+message Progress {
+  int32 current = 1;
+  int32 total = 2;
+  string label = 3;
+}
+
+message Status {
+  // "running", "completed", "failed"
+  string state = 1;
+}
+
+message Error {
+  string message = 1;
+  string traceback = 2;
+}
+
+message DataResult {
+  string key = 1;
+  bytes value = 2;
+}
+
+message CacheCreate {
+  string key = 1;
+  int64 size = 2;
+  string shm_name = 3;
+}
+
+message CacheLookup {
+  string key = 1;
+}
+
+message CacheInfo {
+  string key = 1;
+  string shm_name = 2;
+  int64 size = 3;
+  bool found = 4;
+}
+
+message CacheRelease {
+  string key = 1;
+}
+
+// File dialog messages — Python requests a native OS dialog via Go/Wails.
+message FileDialogRequest {
+  string type = 1;             // "open" or "save"
+  string title = 2;
+  repeated FileFilter filters = 3;
+  string directory = 4;        // initial directory
+  string filename = 5;         // suggested filename (save only)
+}
+
+message FileFilter {
+  string display_name = 1;     // e.g. "Text Files"
+  string pattern = 2;          // e.g. "*.txt"
+}
+
+message FileDialogResponse {
+  repeated string paths = 1;   // selected path(s); empty if cancelled
+  bool cancelled = 2;
+}
+
+// Database messages — Python scripts execute SQL against Go's SQLite database.
+message DbExecute {
+  string sql = 1;
+  repeated string params = 2;  // positional ? placeholders
+}
+
+message DbQuery {
+  string sql = 1;
+  repeated string params = 2;  // positional ? placeholders
+}
+
+message DbResult {
+  int64 rows_affected = 1;
+  int64 last_insert_id = 2;
+  string error = 3;            // empty = success
+}
+
+message DbRow {
+  repeated string values = 1;  // all values as strings; NULL -> ""
+}
+
+message DbQueryResult {
+  repeated string columns = 1;
+  repeated DbRow rows = 2;
+  string error = 3;            // empty = success
+}

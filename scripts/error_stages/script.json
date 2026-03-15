@@ -1,0 +1,21 @@
+{
+  "id": "error_stages",
+  "name": "Error Stages",
+  "description": "Completes partial work then fails — tests error propagation path",
+  "params": [
+    {
+      "name": "fail_at",
+      "type": "string",
+      "required": false,
+      "default": "3",
+      "description": "Step number at which to fail (1-based)"
+    },
+    {
+      "name": "total",
+      "type": "string",
+      "required": false,
+      "default": "5",
+      "description": "Total number of steps"
+    }
+  ]
+}

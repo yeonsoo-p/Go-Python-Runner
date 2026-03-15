@@ -1,4 +1,50 @@
+# Claude Code
 .claude
+
+# Python
 .venv/
 venv*/
 __pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Go
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Generated code (regenerated from proto/runner.proto and Go service structs)
+internal/gen/
+scripts/_lib/gen/
+frontend/bindings/
+
+# Node / Frontend
+frontend/dist
+frontend/node_modules
+coverage/
+
+# Wails build artifacts
+.task
+build/linux/appimage/build
+build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+
+# Bundled Python runtime (created by build/bundle_python.sh)
+python/python/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# Project-local
+reference/

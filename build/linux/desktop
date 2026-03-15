@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=My Product
+Comment=A go-python-runner application
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/go-python-runner.exe %u
+Terminal=false
+Type=Application
+Icon=go-python-runner.exe
+Categories=Utility;
+StartupWMClass=go-python-runner.exe
+
+ 

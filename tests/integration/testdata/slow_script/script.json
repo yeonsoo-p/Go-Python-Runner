@@ -1,0 +1,6 @@
+{
+  "id": "slow",
+  "name": "Slow Script",
+  "description": "Runs slowly for cancel testing",
+  "params": []
+}

@@ -1,0 +1,14 @@
+{
+  "id": "cache_consume",
+  "name": "Cache Consume",
+  "description": "Retrieves a cached numpy array from shared memory. Run while Cache Produce is still holding.",
+  "params": [
+    {
+      "name": "key",
+      "type": "string",
+      "required": false,
+      "default": "shared_array",
+      "description": "Cache key to retrieve"
+    }
+  ]
+}

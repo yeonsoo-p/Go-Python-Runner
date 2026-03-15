@@ -1,0 +1,14 @@
+{
+  "id": "db_todo",
+  "name": "Todo List",
+  "description": "Manages a todo list in SQLite \u2014 creates, lists, completes, and cleans up tasks",
+  "params": [
+    {
+      "name": "action",
+      "type": "string",
+      "required": false,
+      "default": "demo",
+      "description": "Action to perform: demo (full lifecycle), list (show todos), cleanup (drop table)"
+    }
+  ]
+}

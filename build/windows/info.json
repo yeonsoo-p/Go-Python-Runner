@@ -1,0 +1,15 @@
+{
+  "fixed": {
+    "file_version": "0.1.0.0"
+  },
+  "info": {
+    "0000": {
+      "ProductVersion": "0.1.0.0",
+      "CompanyName": "Go Python Runner",
+      "FileDescription": "Orchestrates bundled Python scripts through a Go backend",
+      "LegalCopyright": "(c) 2026, Go Python Runner",
+      "ProductName": "Go Python Runner",
+      "Comments": ""
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "id": "echo",
+  "name": "Echo Script",
+  "description": "Echoes params back as output",
+  "params": [
+    {"name": "message", "type": "string", "required": false, "default": "hello", "description": "Message to echo"}
+  ]
+}

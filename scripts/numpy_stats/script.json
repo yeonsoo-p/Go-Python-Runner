@@ -1,0 +1,14 @@
+{
+  "id": "numpy_stats",
+  "name": "Numpy Statistics",
+  "description": "Computes statistics on numeric data using numpy",
+  "params": [
+    {
+      "name": "data",
+      "type": "string",
+      "required": true,
+      "default": "",
+      "description": "Comma-separated numbers (e.g. 1.5,2.3,4.1,3.7)"
+    }
+  ]
+}

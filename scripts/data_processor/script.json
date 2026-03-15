@@ -1,0 +1,21 @@
+{
+  "id": "data_processor",
+  "name": "Data Processor",
+  "description": "Performs iterative text analysis with increasing depth",
+  "params": [
+    {
+      "name": "input",
+      "type": "string",
+      "required": true,
+      "default": "",
+      "description": "Text to analyze"
+    },
+    {
+      "name": "iterations",
+      "type": "string",
+      "required": false,
+      "default": "3",
+      "description": "Number of analysis passes (each deeper than the last)"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+[project]
+name = "go-python-runner-scripts"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "grpcio",
+    "protobuf",
+    "numpy",
+    "grpcio-tools",
+    "pytest",
+    "mypy",
+    "mypy-protobuf",
+    "ruff",
+    "grpc-stubs",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = ["scripts/_lib/gen/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# E402: scripts must modify sys.path before importing from _lib — noqa inline is appropriate there
+allowed-confusables = []
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+ignore_missing_imports = true
