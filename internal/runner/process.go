@@ -111,28 +111,37 @@ func (p *Process) Cancel() {
 }
 
 // FindPython locates the Python interpreter using the fallback order:
-// 1. .venv/Scripts/python.exe (Windows) or .venv/bin/python3 (Unix) — dev mode
-// 2. python/python.exe (Windows) or python/bin/python3 (Unix) — distribution mode
+// 1. .venv/ relative to CWD — dev mode (running from project root)
+// 2. .venv/ relative to executable — dev mode (binary in bin/ subdirectory)
+// 3. python/ relative to executable — distribution mode (bundled interpreter)
 func FindPython() (string, error) {
-	// Dev mode: uv-managed venv
-	var venvPython string
+	var venvRel string
 	if runtime.GOOS == "windows" {
-		venvPython = filepath.Join(".venv", "Scripts", "python.exe")
+		venvRel = filepath.Join(".venv", "Scripts", "python.exe")
 	} else {
-		venvPython = filepath.Join(".venv", "bin", "python3")
-	}
-	if _, err := os.Stat(venvPython); err == nil {
-		abs, err := filepath.Abs(venvPython)
-		if err != nil {
-			return "", fmt.Errorf("resolving venv python path: %w", err)
-		}
-		return abs, nil
+		venvRel = filepath.Join(".venv", "bin", "python3")
 	}
 
-	// Distribution mode: bundled python next to executable
+	// Dev mode: venv relative to CWD
+	if _, err := os.Stat(venvRel); err == nil {
+		if abs, err := filepath.Abs(venvRel); err == nil {
+			return abs, nil
+		}
+	}
+
 	execPath, err := os.Executable()
 	if err == nil {
 		execDir := filepath.Dir(execPath)
+
+		// Dev mode: venv relative to executable's parent (e.g., bin/ -> project root)
+		venvFromExec := filepath.Join(execDir, "..", venvRel)
+		if _, err := os.Stat(venvFromExec); err == nil {
+			if abs, err := filepath.Abs(venvFromExec); err == nil {
+				return abs, nil
+			}
+		}
+
+		// Distribution mode: bundled python next to executable
 		var bundledPython string
 		if runtime.GOOS == "windows" {
 			bundledPython = filepath.Join(execDir, "python", "python.exe")

@@ -55,6 +55,8 @@ dev:
 build:
 	cd frontend && npm run build
 	wails3 build
+	uv run python -c "import shutil,os; dst='bin/scripts'; shutil.rmtree(dst,True); shutil.copytree('scripts',dst,ignore=shutil.ignore_patterns('tests','__pycache__'))"
+	uv run python -c "import shutil,os; dst='bin/python'; shutil.rmtree(dst,True); shutil.copytree('python',dst) if os.path.isdir('python') else None"
 
 bundle-python:
 	uv run python build/bundle_python.py
