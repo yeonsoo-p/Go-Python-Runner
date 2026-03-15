@@ -11,6 +11,7 @@ import contextlib
 import importlib
 import os
 import pickle
+import queue
 import sys
 import threading
 import traceback
@@ -28,10 +29,15 @@ if _lib_dir not in sys.path:
 runner_pb2 = importlib.import_module("gen.runner_pb2")
 runner_pb2_grpc = importlib.import_module("gen.runner_pb2_grpc")
 
+# Status constants — must match Go RunStatus values
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+
 # Module-level state
 _stub: Any = None
 _stream: Any = None
 _cache_refs: dict[str, shared_memory.SharedMemory] = {}
+_cache_owned: set[str] = set()  # keys created by this process (need unlink on cleanup)
 _run_id: str | None = None
 
 
@@ -75,6 +81,58 @@ _msg_iter = _MessageIterator()
 def _send(msg: Any) -> None:
     """Send a ClientMessage through the gRPC stream."""
     _msg_iter.put(msg)
+
+
+# Timeout for blocking server responses (cache_get, dialogs, db queries).
+_RESPONSE_TIMEOUT = 30  # seconds
+
+# Persistent reader thread and queue for server responses.
+# This avoids the bug where a ThreadPoolExecutor timeout leaves an orphaned
+# thread consuming the next message from the stream, desynchronizing the protocol.
+_response_queue: queue.Queue[Any] = queue.Queue()
+_reader_error: Any = None  # set if the reader thread encounters an error
+_reader_started = False
+
+
+def _start_reader_thread() -> None:
+    """Start a daemon thread that reads server messages into a queue."""
+    global _reader_started
+    if _reader_started:
+        return
+    _reader_started = True
+
+    def _reader() -> None:
+        global _reader_error
+        try:
+            for msg in _stream:
+                _response_queue.put(msg)
+        except Exception as e:
+            _reader_error = e
+        finally:
+            # Sentinel to unblock any waiting get()
+            _response_queue.put(None)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+
+def _recv_response(operation: str = "server response", timeout: float = _RESPONSE_TIMEOUT) -> Any:
+    """Receive next server message with timeout to prevent deadlocks."""
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+    _start_reader_thread()
+    try:
+        msg = _response_queue.get(timeout=timeout)
+    except queue.Empty:
+        raise RuntimeError(
+            f"Timed out waiting for {operation} after {timeout}s "
+            "(possible deadlock in bidirectional stream)"
+        ) from None
+    if msg is None:
+        if _reader_error is not None:
+            raise RuntimeError(f"Server stream error while waiting for {operation}: {_reader_error}") from None
+        raise RuntimeError(f"Server closed stream unexpectedly while waiting for {operation}")
+    return msg
 
 
 def connect() -> dict[str, str]:
@@ -130,7 +188,7 @@ def progress(current: int, total: int, label: str = "") -> None:
 def complete() -> None:
     """Send a completed status to Go and close the stream."""
     _send(runner_pb2.ClientMessage(
-        status=runner_pb2.Status(state="completed")
+        status=runner_pb2.Status(state=STATUS_COMPLETED)
     ))
     _finish()
 
@@ -143,7 +201,7 @@ def fail(message: str, tb: str | None = None) -> None:
         error=runner_pb2.Error(message=str(message), traceback=str(tb))
     ))
     _send(runner_pb2.ClientMessage(
-        status=runner_pb2.Status(state="failed")
+        status=runner_pb2.Status(state=STATUS_FAILED)
     ))
     _finish()
 
@@ -159,7 +217,13 @@ def _finish() -> None:
         for _ in _stream:
             pass
     except grpc.RpcError as e:
-        print(f"[runner] gRPC error during stream drain: {e}", file=sys.stderr)
+        status_code = e.code() if hasattr(e, "code") else "UNKNOWN"
+        details = e.details() if hasattr(e, "details") else str(e)
+        print(
+            f"[runner] WARNING: gRPC error during stream drain "
+            f"(status={status_code}): {details}",
+            file=sys.stderr,
+        )
 
 
 def data_result(key: str, value: bytes) -> None:
@@ -176,20 +240,28 @@ def cache_set(key: str, obj: object) -> None:
     """Pickle any Python object into a shared memory block and register with Go."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     shm = shared_memory.SharedMemory(create=True, size=len(data))
-    if shm.buf is None:
-        raise RuntimeError("SharedMemory buffer is None")
-    shm.buf[:len(data)] = data
+    try:
+        if shm.buf is None:
+            raise RuntimeError("SharedMemory buffer is None")
+        shm.buf[:len(data)] = data
 
-    # Store ref before _send so handle isn't orphaned if _send raises
+        _send(runner_pb2.ClientMessage(
+            cache_create=runner_pb2.CacheCreate(
+                key=str(key),
+                size=len(data),
+                shm_name=shm.name,
+            )
+        ))
+    except Exception:
+        # Clean up the shared memory block if registration with Go failed
+        with contextlib.suppress(OSError):
+            shm.close()
+        with contextlib.suppress(OSError):
+            shm.unlink()
+        raise
+
     _cache_refs[key] = shm
-
-    _send(runner_pb2.ClientMessage(
-        cache_create=runner_pb2.CacheCreate(
-            key=str(key),
-            size=len(data),
-            shm_name=shm.name,
-        )
-    ))
+    _cache_owned.add(key)
 
 
 def cache_get(key: str) -> object:
@@ -204,8 +276,8 @@ def cache_get(key: str) -> object:
 
     # Wait for CacheInfo response from Go
     try:
-        resp = next(_stream)
-    except (StopIteration, grpc.RpcError) as e:
+        resp = _recv_response("cache lookup")
+    except grpc.RpcError as e:
         raise RuntimeError(f"Lost connection while waiting for cache info: {e}") from e
     if not resp.HasField("cache_info"):
         raise RuntimeError(f"Expected CacheInfo response, got {resp}")
@@ -225,9 +297,13 @@ def cache_get(key: str) -> object:
 def cache_release(key: str) -> None:
     """Release local reference to a shared memory block."""
     if key in _cache_refs:
+        shm = _cache_refs.pop(key)
         with contextlib.suppress(OSError):
-            _cache_refs[key].close()
-        del _cache_refs[key]
+            shm.close()
+        if key in _cache_owned:
+            with contextlib.suppress(OSError):
+                shm.unlink()
+            _cache_owned.discard(key)
 
     _send(runner_pb2.ClientMessage(
         cache_release=runner_pb2.CacheRelease(key=str(key))
@@ -268,11 +344,13 @@ def open_file_dialog(
         )
     ))
     try:
-        resp = next(_stream)
-    except (StopIteration, grpc.RpcError) as e:
+        resp = _recv_response("file dialog")
+    except grpc.RpcError as e:
         raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
     if not resp.HasField("file_dialog_response"):
         raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+    if resp.file_dialog_response.error:
+        raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
     if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
         return None
     return str(resp.file_dialog_response.paths[0])
@@ -312,11 +390,13 @@ def save_file_dialog(
         )
     ))
     try:
-        resp = next(_stream)
-    except (StopIteration, grpc.RpcError) as e:
+        resp = _recv_response("save dialog")
+    except grpc.RpcError as e:
         raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
     if not resp.HasField("file_dialog_response"):
         raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+    if resp.file_dialog_response.error:
+        raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
     if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
         return None
     return str(resp.file_dialog_response.paths[0])
@@ -349,8 +429,8 @@ def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
     ))
 
     try:
-        resp = next(_stream)
-    except (StopIteration, grpc.RpcError) as e:
+        resp = _recv_response("db execute")
+    except grpc.RpcError as e:
         raise RuntimeError(f"Lost connection while waiting for db result: {e}") from e
     if not resp.HasField("db_result"):
         raise RuntimeError(f"Expected DbResult response, got {resp}")
@@ -388,8 +468,8 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
     ))
 
     try:
-        resp = next(_stream)
-    except (StopIteration, grpc.RpcError) as e:
+        resp = _recv_response("db query")
+    except grpc.RpcError as e:
         raise RuntimeError(f"Lost connection while waiting for db query result: {e}") from e
     if not resp.HasField("db_query_result"):
         raise RuntimeError(f"Expected DbQueryResult response, got {resp}")
@@ -402,11 +482,15 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
 
 
 def _cleanup_cache() -> None:
-    """Close all shared memory references on exit."""
-    for shm in _cache_refs.values():
+    """Close all shared memory references on exit, unlinking blocks we created."""
+    for key, shm in _cache_refs.items():
         with contextlib.suppress(OSError):
             shm.close()
+        if key in _cache_owned:
+            with contextlib.suppress(OSError):
+                shm.unlink()
     _cache_refs.clear()
+    _cache_owned.clear()
 
 
 atexit.register(_cleanup_cache)

@@ -24,7 +24,8 @@ var assets embed.FS
 
 func main() {
 	// Initialize logging
-	ring := logging.NewRingBuffer(1000)
+	const ringBufferCapacity = 1000
+	ring := logging.NewRingBuffer(ringBufferCapacity)
 	logger, err := logging.NewLogger(logging.DefaultLogDir(), ring)
 	if err != nil {
 		log.Fatalf("failed to initialize logger: %v", err)
@@ -75,6 +76,13 @@ func main() {
 	}
 	defer grpcServer.Stop()
 	logger.Info("gRPC server started", "addr", grpcServer.Addr(), "source", "backend")
+
+	// Monitor gRPC server for runtime failures
+	go func() {
+		if err := <-grpcServer.ServeErr(); err != nil {
+			logger.Error("gRPC server died, script execution will not work", "error", err.Error(), "source", "backend")
+		}
+	}()
 
 	// Initialize process manager
 	mgr := runner.NewManager(grpcServer, cache, logger)

@@ -96,7 +96,7 @@ func TestFullRun(t *testing.T) {
 			hasProgress = true
 			t.Logf("Progress: %d/%d %s", m.Current, m.Total, m.Label)
 		case runner.StatusMsg:
-			if m.State == "completed" {
+			if m.State == runner.StatusCompleted {
 				hasCompleted = true
 			}
 			t.Logf("Status: %s", m.State)

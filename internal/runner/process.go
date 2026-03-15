@@ -77,11 +77,12 @@ func (p *Process) Start() error {
 	// Read stderr in background
 	go func() {
 		data, err := io.ReadAll(stderrPipe)
-		if err != nil {
-			return
-		}
 		p.stderrMu.Lock()
-		p.stderr.Write(data)
+		if err != nil {
+			p.stderr.WriteString(fmt.Sprintf("[stderr capture failed: %v]", err))
+		} else {
+			p.stderr.Write(data)
+		}
 		p.stderrMu.Unlock()
 	}()
 

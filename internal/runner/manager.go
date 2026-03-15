@@ -9,11 +9,28 @@ import (
 	"github.com/google/uuid"
 )
 
+// maxStderrLog is the maximum number of bytes of stderr output to log.
+const maxStderrLog = 4096
+
+// RunStatus represents the lifecycle state of a script run.
+type RunStatus string
+
+const (
+	StatusRunning   RunStatus = "running"
+	StatusCompleted RunStatus = "completed"
+	StatusFailed    RunStatus = "failed"
+)
+
+// IsTerminal returns true if the status represents a final state.
+func (s RunStatus) IsTerminal() bool {
+	return s == StatusCompleted || s == StatusFailed
+}
+
 // RunState tracks the state of a single script execution.
 type RunState struct {
 	RunID    string
 	ScriptID string
-	Status   string // "running", "completed", "failed"
+	Status   RunStatus
 	process  *Process
 	messages <-chan Message
 	cancel   func()
@@ -23,7 +40,7 @@ type RunState struct {
 type RunRecord struct {
 	RunID     string
 	ScriptID  string
-	Status    string
+	Status    RunStatus
 	StartedAt time.Time
 	EndedAt   time.Time
 }
@@ -69,7 +86,7 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 	state := &RunState{
 		RunID:    runID,
 		ScriptID: scriptID,
-		Status:   "running",
+		Status:   StatusRunning,
 		process:  proc,
 		messages: msgCh,
 		cancel:   proc.Cancel,
@@ -85,77 +102,92 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 		"source", "backend",
 	)
 
-	// Send start params to Python once it connects
-	go func() {
-		// Wait for Python to connect
-		select {
-		case <-m.grpc.WaitConnected(runID):
-		case <-time.After(30 * time.Second):
-			m.logger.Error("timeout waiting for Python to connect, killing process", "runID", runID, "source", "backend")
-			proc.Cancel()
-			return
-		}
-		if err := m.grpc.SendStart(runID, params); err != nil {
-			m.logger.Error("failed to send start params, killing process",
-				"runID", runID,
-				"error", err.Error(),
-				"source", "backend",
-			)
-			proc.Cancel()
-		}
-	}()
-
-	// Goroutine: wait for process exit, then cleanup
-	go func() {
-		exitCode, stderrOutput, err := proc.Wait()
-		endedAt := time.Now()
-
-		finalStatus := "completed"
-		if err != nil || exitCode != 0 {
-			finalStatus = "failed"
-			if stderrOutput != "" {
-				const maxStderr = 4096
-				logStderr := stderrOutput
-				if len(logStderr) > maxStderr {
-					logStderr = logStderr[:maxStderr] + "\n... (truncated)"
-				}
-				m.logger.Error("script stderr",
-					"runID", runID,
-					"scriptID", scriptID,
-					"stderr", logStderr,
-					"source", "python",
-				)
-			}
-		}
-
-		// Clean up
-		m.cache.CleanupRun(runID)
-		m.grpc.UnregisterRun(runID)
-
-		m.mu.Lock()
-		if s, ok := m.activeRuns[runID]; ok {
-			s.Status = finalStatus
-		}
-		delete(m.activeRuns, runID)
-		m.history = append(m.history, RunRecord{
-			RunID:     runID,
-			ScriptID:  scriptID,
-			Status:    finalStatus,
-			StartedAt: startedAt,
-			EndedAt:   endedAt,
-		})
-		m.mu.Unlock()
-
-		m.logger.Info("run finished",
-			"runID", runID,
-			"scriptID", scriptID,
-			"status", finalStatus,
-			"exitCode", exitCode,
-			"source", "backend",
-		)
-	}()
+	go m.waitAndSendStart(runID, params, proc)
+	go m.waitForExit(runID, scriptID, startedAt, proc)
 
 	return runID, msgCh, nil
+}
+
+// connectTimeout is the maximum time to wait for a Python script to connect via gRPC.
+const connectTimeout = 30 * time.Second
+
+// waitAndSendStart waits for the Python script to connect, then sends start params.
+func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc *Process) {
+	select {
+	case <-m.grpc.WaitConnected(runID):
+	case <-time.After(connectTimeout):
+		m.logger.Error("timeout waiting for Python to connect, killing process", "runID", runID, "source", "backend")
+		proc.Cancel()
+		return
+	}
+	if err := m.grpc.SendStart(runID, params); err != nil {
+		m.logger.Error("failed to send start params, killing process",
+			"runID", runID,
+			"error", err.Error(),
+			"source", "backend",
+		)
+		proc.Cancel()
+	}
+}
+
+// waitForExit waits for the process to exit, logs stderr if needed, and records the run.
+func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc *Process) {
+	exitCode, stderrOutput, err := proc.Wait()
+	endedAt := time.Now()
+
+	finalStatus := StatusCompleted
+	if err != nil || exitCode != 0 {
+		finalStatus = StatusFailed
+		// Only log stderr if we didn't already get a structured error via gRPC,
+		// to avoid duplicate error events for the same failure.
+		if stderrOutput != "" && !m.grpc.GotError(runID) {
+			logStderr := stderrOutput
+			if len(logStderr) > maxStderrLog {
+				logStderr = logStderr[:maxStderrLog] + "\n... (truncated)"
+			}
+			m.grpc.TrySendError(runID, logStderr)
+			m.logger.Error("script stderr",
+				"runID", runID,
+				"scriptID", scriptID,
+				"stderr", logStderr,
+				"source", "python",
+			)
+		}
+	}
+
+	m.cache.CleanupRun(runID)
+	m.grpc.UnregisterRun(runID)
+
+	m.mu.Lock()
+	if s, ok := m.activeRuns[runID]; ok {
+		if !s.Status.IsTerminal() {
+			s.Status = finalStatus
+		} else {
+			m.logger.Warn("ignoring status transition from terminal state",
+				"runID", runID,
+				"current", string(s.Status),
+				"attempted", string(finalStatus),
+				"source", "backend",
+			)
+		}
+	}
+	delete(m.activeRuns, runID)
+	m.history = append(m.history, RunRecord{
+		RunID:     runID,
+		ScriptID:  scriptID,
+		Status:    finalStatus,
+		StartedAt: startedAt,
+		EndedAt:   endedAt,
+	})
+	m.mu.Unlock()
+
+	m.logger.Info("run finished",
+		"runID", runID,
+		"scriptID", scriptID,
+		"status", finalStatus,
+		"exitCode", exitCode,
+		"source", "backend",
+	)
 }
 
 // CancelRun cancels a running script.
@@ -172,7 +204,9 @@ func (m *Manager) CancelRun(runID string) error {
 		m.logger.Debug("gRPC cancel failed, falling back to process kill", "runID", runID, "error", err.Error(), "source", "backend")
 	}
 
-	// Then kill the process
+	// state.cancel is proc.Cancel which calls context.CancelFunc — safe to call
+	// after the run is removed from activeRuns by waitForExit, since CancelFunc
+	// is idempotent and the GC keeps the state pointer alive.
 	state.cancel()
 	m.logger.Info("run cancelled", "runID", runID, "source", "backend")
 	return nil

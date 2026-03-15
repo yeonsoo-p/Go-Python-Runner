@@ -106,6 +106,7 @@ message FileFilter {
 message FileDialogResponse {
   repeated string paths = 1;   // selected path(s); empty if cancelled
   bool cancelled = 2;
+  string error = 3;            // non-empty if dialog failed (vs user cancelled)
 }
 
 // Database messages — Python scripts execute SQL against Go's SQLite database.

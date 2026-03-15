@@ -10,7 +10,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 4. **Schema**: Protobuf `.proto` file as single source of truth; `oneof` for compile-time type safety
 5. **Go concurrency**: Typed channels + interface types + type switches (idiomatic Go)
 6. **Scripts**: Bundled with app in the repository
-7. **Frontend**: React 18 + TypeScript + Vite + Tailwind (via Wails v3)
+7. **Frontend**: React 19 + TypeScript + Vite + Tailwind (via Wails v3)
 8. **Python runtime**: Dev: `uv` manages interpreter + venv + deps. Distribution: bundled portable interpreter via python-build-standalone (no user setup)
 9. **Python deps**: Shared base (`grpcio`, `protobuf`, `numpy`) — managed by `uv` in dev, pre-installed at build time for distribution
 10. **Logging**: Unified structured logging via Go `log/slog` — frontend, backend, and Python errors all funnel into one system
@@ -56,11 +56,14 @@ go-python-runner/
 │   │   ├── runner_service_test.go
 │   │   ├── log_service.go         # Wails service: receive frontend errors, expose logs
 │   │   └── log_service_test.go
+│   ├── db/
+│   │   ├── db.go                  # SQLite database: run history + key-value store
+│   │   └── db_test.go
 │   ├── runner/
-│   │   ├── manager.go             # Process lifecycle, typed channels
-│   │   ├── manager_test.go
+│   │   ├── manager.go             # Process lifecycle, typed channels, RunStatus type
 │   │   ├── process.go             # Single subprocess: spawn, gRPC, wait
-│   │   ├── process_test.go
+│   │   ├── process_windows.go     # Windows-specific process handling
+│   │   ├── process_other.go       # Linux/macOS process handling
 │   │   ├── grpc_server.go         # gRPC server for Python clients
 │   │   ├── grpc_server_test.go
 │   │   ├── cache.go               # Shared memory cache manager (registry + lifecycle)
@@ -104,6 +107,15 @@ go-python-runner/
 │   ├── file_export/               # File export via native save dialog
 │   │   ├── script.json
 │   │   └── main.py
+│   ├── db_todo/                   # SQLite todo list (db_execute + db_query)
+│   │   ├── script.json
+│   │   └── main.py
+│   ├── db_keyvalue/               # SQLite key-value store (db_execute + db_query)
+│   │   ├── script.json
+│   │   └── main.py
+│   ├── db_run_history/            # Query run history from SQLite (db_query)
+│   │   ├── script.json
+│   │   └── main.py
 │   └── error_stages/              # Partial failure (error propagation path)
 │       ├── script.json
 │       └── main.py
@@ -118,15 +130,13 @@ go-python-runner/
 │       │   ├── TaskCard.tsx
 │       │   ├── TaskCard.test.tsx
 │       │   ├── TaskGrid.tsx
-│       │   ├── TaskGrid.test.tsx
 │       │   ├── RunOutput.tsx
 │       │   ├── ParamForm.tsx
 │       │   ├── ParamForm.test.tsx
 │       │   ├── LogViewer.tsx        # Unified log panel with filters
 │       │   └── LogViewer.test.tsx
 │       └── hooks/
-│           ├── useScripts.ts      # Wails bindings + events
-│           └── useScripts.test.ts
+│           └── useScripts.ts      # Wails bindings + events, RunStatus type
 ├── python/
 │   ├── README.md                  # How to set up portable Python
 │   └── requirements.txt           # Shared base deps (grpcio, protobuf)
@@ -135,10 +145,15 @@ go-python-runner/
 │       ├── full_run_test.go
 │       ├── parallel_test.go
 │       ├── plugin_test.go
+│       ├── error_propagation_test.go
 │       └── testdata/              # Fixture scripts for tests
 │           ├── echo_script/
 │           ├── crash_script/
-│           └── slow_script/
+│           ├── slow_script/
+│           ├── partial_fail/
+│           ├── cache_producer/
+│           ├── cache_consumer/
+│           └── cache_crash/
 ├── build/
 │   └── bundle_python.sh           # Download + package portable Python
 ├── Makefile                       # Build + test orchestration
@@ -151,8 +166,8 @@ Single source of truth: `proto/runner.proto`. Both Go and Python use generated c
 
 One bidirectional streaming RPC (`Execute`). Message direction follows gRPC client/server roles:
 
-- **ClientMessage** (Python → Go): `Output`, `Progress`, `Status`, `Error`, `DataResult`, `CacheCreate`, `CacheLookup`, `CacheRelease`
-- **ServerMessage** (Go → Python): `StartRequest` (with params map), `CancelRequest`, `CacheInfo`
+- **ClientMessage** (Python → Go): `Output`, `Progress`, `Status`, `Error`, `DataResult`, `CacheCreate`, `CacheLookup`, `CacheRelease`, `FileDialogRequest`, `DbExecute`, `DbQuery`
+- **ServerMessage** (Go → Python): `StartRequest` (with params map), `CancelRequest`, `CacheInfo`, `FileDialogResponse`, `DbResult`, `DbQueryResult`
 
 ## Wails v3 Services
 
@@ -263,10 +278,14 @@ JSON file with fields: `id`, `name`, `description`, `params[]` (each with `name`
 Scripts add `_lib` to `sys.path`, then import from the `runner` helper module. The lifecycle is:
 
 1. `connect()` — establishes a bidirectional gRPC stream, waits for `StartRequest` from Go, returns the params dict
-2. Script logic — calls `output()`, `progress()`, `data_result()`, `cache_set()`/`cache_get()` as needed
+2. Script logic — calls any combination of:
+   - `output()`, `progress()`, `data_result()` — send results to frontend
+   - `cache_set()`/`cache_get()`/`cache_release()` — shared memory between scripts
+   - `open_file_dialog()`/`save_file_dialog()` — native OS file pickers
+   - `db_execute()`/`db_query()` — SQLite database access
 3. `complete()` or `fail()` — closes the send stream and drains until Go confirms receipt (EOF), guaranteeing all messages are delivered before the process exits
 
-See `scripts/hello_world/main.py` for the simplest example, `scripts/numpy_stats/main.py` for one using pre-installed packages, `scripts/cache_produce/main.py` and `scripts/cache_consume/main.py` for shared memory caching across parallel scripts, and `scripts/file_export/main.py` for native file dialogs.
+See `scripts/hello_world/main.py` for the simplest example, `scripts/numpy_stats/main.py` for pre-installed packages, `scripts/cache_produce/main.py` and `scripts/cache_consume/main.py` for shared memory caching, `scripts/file_export/main.py` for native file dialogs, and `scripts/db_todo/main.py` for database access.
 
 ## Python Runtime
 
@@ -283,7 +302,7 @@ Two modes: `uv`-managed for development, bundled portable Python for distributio
 
 Commands:
 
-- `uv sync` — downloads Python 3.12+, creates `.venv/`, installs all deps (first time setup)
+- `uv sync` — downloads Python 3.13+, creates `.venv/`, installs all deps (first time setup)
 - `uv run pytest scripts/_lib/tests/` — run Python tests
 - `uv run python -m grpc_tools.protoc ...` — protobuf codegen
 - Never call `pip` or `python` directly — always use `uv run`
@@ -397,6 +416,90 @@ Three functions: `cache_set(key, obj)`, `cache_get(key)`, `cache_release(key)`. 
 - **Windows limitation**: The OS reclaims shared memory when the last handle closes. Cross-process sharing requires concurrent runs — a producer that exits before its consumer starts will leave the Go registry intact but the underlying memory gone. The `cache_produce` script holds its handle alive for a configurable duration so `cache_consume` can retrieve the data while it's still running.
 - On Linux: shared memory blocks persist in `/dev/shm/` until explicitly unlinked.
 
+## Run Lifecycle State Machine
+
+The run lifecycle is governed by a **distributed state machine** spanning 4 layers. Typed status constants and transition guards were added to formalize the critical paths.
+
+### Composite State
+
+A run's true state is the combination of multiple independent variables across layers:
+
+| Layer | State Variables | Location |
+| --- | --- | --- |
+| Go Manager | `RunState.Status` (typed `RunStatus`: `StatusRunning` / `StatusCompleted` / `StatusFailed`), presence in `activeRuns` map | `internal/runner/manager.go` |
+| gRPC RunChannel | `stream` (nil/set), `connected` (chan open/closed), `closed` (bool), `gotError` (`atomic.Bool`) | `internal/runner/grpc_server.go` |
+| Python client | `_stream` (None/set), `_msg_iter._done` (bool), `_cache_refs` (dict of SharedMemory handles) | `scripts/_lib/runner.py` |
+| React frontend | `RunState.status` (typed `RunStatus` union), `output[]`, `progress`, `error` | `frontend/src/hooks/useScripts.ts` |
+
+### State Transitions
+
+```text
+REGISTERED
+│  Go: RegisterRun() creates RunChannel (stream=nil, connected=open)
+│  manager.go:62
+│
+├─ proc.Start() succeeds
+▼
+PROCESS_STARTED
+│  Go: Status="running", added to activeRuns map
+│  RunChannel: stream=nil, waiting for Python to connect
+│  React: status="running" (set immediately on startRun)
+│  manager.go:72-83
+│
+├─ Python connects via gRPC ──────────────── or ── 30s timeout → FAILED
+▼                                                   manager.go:96-99
+CONNECTED
+│  RunChannel: stream=set, connected=closed (via sync.Once)
+│  grpc_server.go:229-230
+│
+├─ SendStart() delivers params
+▼
+EXECUTING
+│  Messages flowing: Output, Progress, DataResult, Cache*, FileDialog, Db*
+│  Python calls output(), progress(), cache_set(), etc.
+│
+├─ exit code 0 ──────┬── exit code != 0 or err ──┬── CancelRun() called
+▼                     ▼                           ▼
+COMPLETED          ERRORED                     CANCELLED
+Status="completed"  Status="failed"             gRPC cancel + proc.Kill
+manager.go:116      GotError flag tracks         Status="failed"
+                    whether structured error     manager.go:177-182
+                    arrived via gRPC vs stderr
+                    manager.go:117-134
+│                     │                           │
+└─────────────────────┴───────────────────────────┘
+                      │
+                      ▼
+               CLEANING UP
+               1. cache.CleanupRun(runID)     — release cache refs
+               2. grpc.UnregisterRun(runID)   — close Messages chan, remove RunChannel
+               3. delete from activeRuns       — remove from live tracking
+               4. append to history[]          — persist as RunRecord
+               manager.go:138-153
+```
+
+### Safeguards
+
+| Safeguard | Detail |
+| --- | --- |
+| **Typed `RunStatus`** | Go: `RunStatus` string type with `StatusRunning`/`StatusCompleted`/`StatusFailed` constants (`manager.go`). TypeScript: `RunStatus` union type (`useScripts.ts`). Python: `STATUS_COMPLETED`/`STATUS_FAILED` constants (`runner.py`). Proto wire format remains `string` — typed boundary at gRPC handler via `RunStatus(m.Status.State)`. |
+| **Transition guards** | Go Manager: `IsTerminal()` prevents overwriting a terminal status (`manager.go`). Frontend: `onStatus` and `onError` handlers skip updates when status is already `"completed"` or `"failed"` (`useScripts.ts`). |
+| **Atomic `gotError`** | `RunChannel.gotError` uses `atomic.Bool` for lock-free, race-free access across goroutines (`grpc_server.go`). |
+
+### Remaining Architectural Notes
+
+| Item | Detail |
+| --- | --- |
+| **Hidden sub-states** | `RunChannel` has its own state machine (`stream=nil` → `stream=set` → `closed=true`) invisible to the `Status` field. A run can be `StatusRunning` while Python hasn't connected or the gRPC stream is dead. This is by design — these are internal to gRPC plumbing and guarded by `closedMu`/`connectOnce`. |
+| **Multiple status sources** | Go Manager (process exit), Python (gRPC `StatusMsg`), and React (error events) can all set status. Transition guards prevent terminal→non-terminal overwrites, but the Go Manager is the authoritative final-status source via `waitForExit`. |
+| **Implicit cleanup ordering** | Cache cleanup → gRPC unregister → map removal → history append must happen in sequence (`manager.go`). Ordering is enforced by code sequencing in the `waitForExit` goroutine. |
+
+### Future Work
+
+- Introduce a `RunPhase` type capturing the full composite state (registered/starting/connected/executing/closing/done) if sub-state visibility becomes needed
+- Centralize all transitions in Manager with a validated `transition(runID, from, to)` method for full formalization
+- Consider promoting `RunStatus` to a proto enum if the typed boundary at the gRPC handler proves insufficient
+
 ## Testing
 
 Three tiers of tests across all layers. Go integration tests are gated behind a build tag so `go test ./...` stays fast.
@@ -466,8 +569,9 @@ Located in `tests/integration/`, gated with `//go:build integration` build tag.
 | `TestCacheShareObject` | Script A caches a dict via `cache_set`, Script B retrieves it via `cache_get` — verify object equality |
 | `TestCacheConcurrentReaders` | 3 scripts reading the same cached object simultaneously — verify no corruption |
 | `TestCacheCleanupOnCrash` | Kill script that owns a cache block — verify Go releases shared memory |
+| `TestErrorPropagation` | Run a script that fails with traceback — verify structured error message + traceback reach the message channel |
 
-Test fixture scripts live in `tests/integration/testdata/` (echo, crash, slow variants).
+Test fixture scripts live in `tests/integration/testdata/` (echo, crash, slow, partial_fail, cache_producer/consumer/crash variants).
 
 ### Test Commands
 
@@ -496,7 +600,7 @@ make test
 | Go <-> Frontend | Wails bindings + events | Zero boilerplate, typed |
 | Go <-> Python | gRPC bidirectional streaming | Typed protobuf contract, parallel |
 | Schema | Protobuf with `oneof` | Cross-language validation, compile-time safe |
-| Frontend | React 18 + TypeScript + Vite + Tailwind | Wails v3 supported |
+| Frontend | React 19 + TypeScript + Vite + Tailwind | Wails v3 supported |
 | Go concurrency | Typed channels + type switches | Idiomatic, compile-time safe |
 | Python dev tooling | `uv` | Downloads Python, manages venv + deps, no system Python needed |
 | Python runtime (dist) | python-build-standalone | Bundled portable Python for end users |
@@ -506,21 +610,6 @@ make test
 | Go testing | `testing` (stdlib) + `testify/assert` | Standard + readable assertions |
 | Python testing | `pytest` | De facto Python test runner |
 | Frontend testing | `vitest` + React Testing Library | Fast, Vite-native, component testing |
-
-## Implementation Phases
-
-1. **Scaffold** — `wails3 init` with React template, set up protobuf toolchain
-2. **Proto + codegen** — Define `runner.proto`, generate Go and Python code
-3. **Go core** — Registry (builtin + plugin loading), process manager, gRPC server, typed channels
-4. **Unified logging** — `slog` multi-handler, ring buffer, lumberjack file rotation
-5. **Wails services** — ScriptService + RunnerService + LogService with events
-6. **Python helper** — `runner.py` wrapping generated gRPC client
-7. **React frontend** — TaskCard, TaskGrid, RunOutput, ParamForm, LogViewer components
-8. **Plugin system** — Plugin directory scanning, override logic, frontend badges
-9. **Unit + service tests** — Go `*_test.go` files, Python `pytest`, frontend `vitest`
-10. **Integration** — Wire everything, test with sample scripts + plugin overrides
-11. **Integration tests** — `tests/integration/` with build tag, fixture scripts in `testdata/`
-12. **Build** — Single executable via `wails3 build` + bundled Python
 
 ## Verification
 

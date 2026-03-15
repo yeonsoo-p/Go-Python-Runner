@@ -13,9 +13,12 @@ function LogViewer() {
       try {
         const bindings = await import('../../bindings/go-python-runner/internal/services')
         if (bindings.LogService?.GetLogs) {
+          // Fetch all logs; client-side filtering handles source/level
+          // (streamed log:entry events bypass the backend, so filtering
+          // must happen here anyway).
           const result = await bindings.LogService.GetLogs({
-            Source: sourceFilter,
-            Level: levelFilter,
+            Source: '',
+            Level: '',
             RunID: '',
             ScriptID: '',
           })
@@ -26,7 +29,7 @@ function LogViewer() {
       }
     }
     loadLogs()
-  }, [sourceFilter, levelFilter])
+  }, [])
 
   useEffect(() => {
     async function setupEvents() {

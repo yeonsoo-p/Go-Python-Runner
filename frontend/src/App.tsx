@@ -5,9 +5,9 @@ import LogViewer from './components/LogViewer'
 
 class ErrorBoundary extends Component<
   { children: ReactNode },
-  { error: Error | null }
+  { error: Error | null; errorKey: number }
 > {
-  state: { error: Error | null } = { error: null }
+  state: { error: Error | null; errorKey: number } = { error: null, errorKey: 0 }
 
   static getDerivedStateFromError(error: Error) {
     return { error }
@@ -30,7 +30,7 @@ class ErrorBoundary extends Component<
             <h2 className="text-lg font-bold text-red-400 mb-2">Something went wrong</h2>
             <p className="text-sm text-slate-300 mb-4">{this.state.error.message}</p>
             <button
-              onClick={() => this.setState({ error: null })}
+              onClick={() => this.setState({ error: null, errorKey: this.state.errorKey + 1 })}
               className="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600 transition"
             >
               Try Again
@@ -39,7 +39,7 @@ class ErrorBoundary extends Component<
         </div>
       )
     }
-    return this.props.children
+    return <div key={this.state.errorKey}>{this.props.children}</div>
   }
 }
 

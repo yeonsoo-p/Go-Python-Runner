@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
@@ -14,6 +15,9 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// messageBufferSize is the capacity of the per-run message channel.
+const messageBufferSize = 100
+
 // Message is the interface for typed messages received from Python scripts.
 type Message interface {
 	messageType()
@@ -21,7 +25,7 @@ type Message interface {
 
 type OutputMsg struct{ Text string }
 type ProgressMsg struct{ Current, Total int32; Label string }
-type StatusMsg struct{ State string }
+type StatusMsg struct{ State RunStatus }
 type ErrorMsg struct{ Message, Traceback string }
 type DataMsg struct{ Key string; Value []byte }
 
@@ -35,11 +39,13 @@ func (DataMsg) messageType()     {}
 type RunChannel struct {
 	Messages      chan Message
 	stream        pb.PythonRunner_ExecuteServer
+	streamMu      sync.Mutex   // protects stream.Send() — gRPC streams are not safe for concurrent sends
 	cancel        chan struct{}
 	connected     chan struct{} // closed when Python connects
 	connectOnce   sync.Once    // prevents double-close on connected
 	closed        bool         // true after UnregisterRun closes Messages
 	closedMu      sync.Mutex   // protects closed flag and channel sends
+	gotError      atomic.Bool  // true if an ErrorMsg was received via gRPC
 }
 
 // DialogHandler opens native file dialogs. Implemented by the Wails app layer.
@@ -65,7 +71,8 @@ type GRPCServer struct {
 	logger   *slog.Logger
 	server   *grpc.Server
 	listener net.Listener
-	dialog   DialogHandler
+	dialog   atomic.Value // stores DialogHandler; set after Wails init, read from goroutines
+	serveErr chan error   // buffered(1), receives Serve() error if it fails
 }
 
 // NewGRPCServer creates and starts a gRPC server on a random port.
@@ -86,18 +93,25 @@ func NewGRPCServer(cache *CacheManager, store *db.DB, logger *slog.Logger) (*GRP
 	s.server = grpc.NewServer()
 	pb.RegisterPythonRunnerServer(s.server, s)
 
+	s.serveErr = make(chan error, 1)
 	go func() {
 		if err := s.server.Serve(lis); err != nil {
 			logger.Error("gRPC server error", "error", err.Error(), "source", "backend")
+			s.serveErr <- err
 		}
 	}()
 
 	return s, nil
 }
 
+// ServeErr returns a channel that receives an error if the gRPC server fails at runtime.
+func (s *GRPCServer) ServeErr() <-chan error {
+	return s.serveErr
+}
+
 // SetDialogHandler sets the native file dialog handler (called after Wails app init).
 func (s *GRPCServer) SetDialogHandler(d DialogHandler) {
-	s.dialog = d
+	s.dialog.Store(d)
 }
 
 // Addr returns the address the gRPC server is listening on.
@@ -111,7 +125,7 @@ func (s *GRPCServer) RegisterRun(runID string) <-chan Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ch := &RunChannel{
-		Messages:  make(chan Message, 100),
+		Messages:  make(chan Message, messageBufferSize),
 		cancel:    make(chan struct{}),
 		connected: make(chan struct{}),
 	}
@@ -161,11 +175,13 @@ func (s *GRPCServer) WaitConnected(runID string) <-chan struct{} {
 // SendStart sends a StartRequest to the Python script for the given run.
 func (s *GRPCServer) SendStart(runID string, params map[string]string) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	ch, ok := s.runs[runID]
+	s.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("run %s not registered", runID)
 	}
+	ch.streamMu.Lock()
+	defer ch.streamMu.Unlock()
 	if ch.stream == nil {
 		return fmt.Errorf("run %s not connected yet", runID)
 	}
@@ -179,11 +195,13 @@ func (s *GRPCServer) SendStart(runID string, params map[string]string) error {
 // SendCancel sends a CancelRequest to the Python script for the given run.
 func (s *GRPCServer) SendCancel(runID string) error {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	ch, ok := s.runs[runID]
+	s.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("run %s not registered", runID)
 	}
+	ch.streamMu.Lock()
+	defer ch.streamMu.Unlock()
 	if ch.stream == nil {
 		return fmt.Errorf("run %s not connected yet", runID)
 	}
@@ -234,6 +252,13 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 	}
 }
 
+// streamSend sends a ServerMessage on the gRPC stream, protected by streamMu.
+func (ch *RunChannel) streamSend(msg *pb.ServerMessage) error {
+	ch.streamMu.Lock()
+	defer ch.streamMu.Unlock()
+	return ch.stream.Send(msg)
+}
+
 func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.ClientMessage, stream pb.PythonRunner_ExecuteServer) error {
 	switch m := msg.Msg.(type) {
 	case *pb.ClientMessage_Output:
@@ -245,8 +270,9 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Label:   m.Progress.Label,
 		})
 	case *pb.ClientMessage_Status:
-		ch.trySend(StatusMsg{State: m.Status.State})
+		ch.trySend(StatusMsg{State: RunStatus(m.Status.State)})
 	case *pb.ClientMessage_Error:
+		ch.gotError.Store(true)
 		ch.trySend(ErrorMsg{
 			Message:   m.Error.Message,
 			Traceback: m.Error.Traceback,
@@ -257,51 +283,68 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Value: m.Data.Value,
 		})
 	case *pb.ClientMessage_CacheCreate:
-		s.cache.Register(m.CacheCreate.Key, m.CacheCreate.ShmName, m.CacheCreate.Size, runID)
-		s.logger.Info("cache block registered",
-			"key", m.CacheCreate.Key,
-			"shmName", m.CacheCreate.ShmName,
-			"size", m.CacheCreate.Size,
-			"runID", runID,
-			"source", "backend",
-		)
+		s.handleCacheCreate(runID, m.CacheCreate)
 	case *pb.ClientMessage_CacheLookup:
-		shmName, size, found := s.cache.Lookup(m.CacheLookup.Key)
-		if found {
-			s.cache.AddRef(m.CacheLookup.Key, runID)
-		}
-		if err := stream.Send(&pb.ServerMessage{
-			Msg: &pb.ServerMessage_CacheInfo{
-				CacheInfo: &pb.CacheInfo{
-					Key:     m.CacheLookup.Key,
-					ShmName: shmName,
-					Size:    size,
-					Found:   found,
-				},
-			},
-		}); err != nil {
-			return fmt.Errorf("send cache info: %w", err)
+		if err := s.handleCacheLookup(runID, ch, m.CacheLookup); err != nil {
+			return err
 		}
 	case *pb.ClientMessage_CacheRelease:
-		s.cache.Release(m.CacheRelease.Key, runID)
-		s.logger.Info("cache block released",
-			"key", m.CacheRelease.Key,
-			"runID", runID,
-			"source", "backend",
-		)
+		s.handleCacheRelease(runID, m.CacheRelease)
 	case *pb.ClientMessage_FileDialog:
-		return s.handleFileDialog(runID, m.FileDialog, stream)
+		return s.handleFileDialog(runID, ch, m.FileDialog)
 	case *pb.ClientMessage_DbExecute:
-		return s.handleDbExecute(runID, m.DbExecute, stream)
+		return s.handleDbExecute(runID, ch, m.DbExecute)
 	case *pb.ClientMessage_DbQuery:
-		return s.handleDbQuery(runID, m.DbQuery, stream)
+		return s.handleDbQuery(runID, ch, m.DbQuery)
 	}
 	return nil
 }
 
-func (s *GRPCServer) handleFileDialog(runID string, req *pb.FileDialogRequest, stream pb.PythonRunner_ExecuteServer) error {
-	if s.dialog == nil {
-		return stream.Send(&pb.ServerMessage{
+func (s *GRPCServer) handleCacheCreate(runID string, req *pb.CacheCreate) {
+	s.cache.Register(req.Key, req.ShmName, req.Size, runID)
+	s.logger.Info("cache block registered",
+		"key", req.Key,
+		"shmName", req.ShmName,
+		"size", req.Size,
+		"runID", runID,
+		"source", "backend",
+	)
+}
+
+func (s *GRPCServer) handleCacheLookup(runID string, ch *RunChannel, req *pb.CacheLookup) error {
+	shmName, size, found := s.cache.LookupAndRef(req.Key, runID)
+	return ch.streamSend(&pb.ServerMessage{
+		Msg: &pb.ServerMessage_CacheInfo{
+			CacheInfo: &pb.CacheInfo{
+				Key:     req.Key,
+				ShmName: shmName,
+				Size:    size,
+				Found:   found,
+			},
+		},
+	})
+}
+
+func (s *GRPCServer) handleCacheRelease(runID string, req *pb.CacheRelease) {
+	if released := s.cache.Release(req.Key, runID); released {
+		s.logger.Info("cache block released",
+			"key", req.Key,
+			"runID", runID,
+			"source", "backend",
+		)
+	} else {
+		s.logger.Warn("cache release ignored: run was not referencing this block",
+			"key", req.Key,
+			"runID", runID,
+			"source", "backend",
+		)
+	}
+}
+
+func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.FileDialogRequest) error {
+	d, _ := s.dialog.Load().(DialogHandler)
+	if d == nil {
+		return ch.streamSend(&pb.ServerMessage{
 			Msg: &pb.ServerMessage_FileDialogResponse{
 				FileDialogResponse: &pb.FileDialogResponse{Cancelled: true},
 			},
@@ -317,29 +360,30 @@ func (s *GRPCServer) handleFileDialog(runID string, req *pb.FileDialogRequest, s
 	var err error
 	switch req.Type {
 	case "save":
-		path, err = s.dialog.SaveFile(req.Title, req.Directory, req.Filename, filters)
+		path, err = d.SaveFile(req.Title, req.Directory, req.Filename, filters)
 	default:
-		path, err = s.dialog.OpenFile(req.Title, req.Directory, filters)
+		path, err = d.OpenFile(req.Title, req.Directory, filters)
 	}
 
 	resp := &pb.FileDialogResponse{}
 	if err != nil {
 		s.logger.Error("file dialog error", "error", err.Error(), "runID", runID, "source", "backend")
 		resp.Cancelled = true
+		resp.Error = err.Error()
 	} else if path == "" {
 		resp.Cancelled = true
 	} else {
 		resp.Paths = []string{path}
 	}
 
-	return stream.Send(&pb.ServerMessage{
+	return ch.streamSend(&pb.ServerMessage{
 		Msg: &pb.ServerMessage_FileDialogResponse{
 			FileDialogResponse: resp,
 		},
 	})
 }
 
-func (s *GRPCServer) handleDbExecute(runID string, req *pb.DbExecute, stream pb.PythonRunner_ExecuteServer) error {
+func (s *GRPCServer) handleDbExecute(runID string, ch *RunChannel, req *pb.DbExecute) error {
 	resp := &pb.DbResult{}
 
 	args := make([]any, len(req.Params))
@@ -351,16 +395,20 @@ func (s *GRPCServer) handleDbExecute(runID string, req *pb.DbExecute, stream pb.
 	if err != nil {
 		resp.Error = err.Error()
 	} else {
-		resp.RowsAffected, _ = result.RowsAffected()
-		resp.LastInsertId, _ = result.LastInsertId()
+		if ra, err := result.RowsAffected(); err == nil {
+			resp.RowsAffected = ra
+		}
+		if li, err := result.LastInsertId(); err == nil {
+			resp.LastInsertId = li
+		}
 	}
 
-	return stream.Send(&pb.ServerMessage{
+	return ch.streamSend(&pb.ServerMessage{
 		Msg: &pb.ServerMessage_DbResult{DbResult: resp},
 	})
 }
 
-func (s *GRPCServer) handleDbQuery(runID string, req *pb.DbQuery, stream pb.PythonRunner_ExecuteServer) error {
+func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQuery) error {
 	resp := &pb.DbQueryResult{}
 
 	args := make([]any, len(req.Params))
@@ -373,10 +421,14 @@ func (s *GRPCServer) handleDbQuery(runID string, req *pb.DbQuery, stream pb.Pyth
 		resp.Error = err.Error()
 	} else {
 		defer rows.Close()
-		cols, _ := rows.Columns()
-		resp.Columns = cols
+		cols, colErr := rows.Columns()
+		if colErr != nil {
+			resp.Error = colErr.Error()
+		} else {
+			resp.Columns = cols
+		}
 
-		for rows.Next() {
+		for resp.Error == "" && rows.Next() {
 			scanArgs := make([]any, len(cols))
 			values := make([]*sql.NullString, len(cols))
 			for i := range cols {
@@ -401,9 +453,32 @@ func (s *GRPCServer) handleDbQuery(runID string, req *pb.DbQuery, stream pb.Pyth
 		}
 	}
 
-	return stream.Send(&pb.ServerMessage{
+	return ch.streamSend(&pb.ServerMessage{
 		Msg: &pb.ServerMessage_DbQueryResult{DbQueryResult: resp},
 	})
+}
+
+// TrySendError sends a synthetic ErrorMsg to a run's message channel.
+// Used to forward stderr output to the frontend when Python crashes without calling fail().
+func (s *GRPCServer) TrySendError(runID, message string) {
+	s.mu.RLock()
+	ch, ok := s.runs[runID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	ch.trySend(ErrorMsg{Message: message, Traceback: ""})
+}
+
+// GotError returns whether the run received a structured error via gRPC.
+func (s *GRPCServer) GotError(runID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ch, ok := s.runs[runID]
+	if !ok {
+		return false
+	}
+	return ch.gotError.Load()
 }
 
 // Stop gracefully shuts down the gRPC server.

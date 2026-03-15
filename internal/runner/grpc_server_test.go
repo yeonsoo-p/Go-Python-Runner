@@ -145,7 +145,7 @@ func TestGRPCServer_StatusMessage(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected StatusMsg, got %T", msg)
 		}
-		if s.State != "completed" {
+		if s.State != StatusCompleted {
 			t.Errorf("expected state 'completed', got %q", s.State)
 		}
 	case <-time.After(2 * time.Second):

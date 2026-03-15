@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	"go-python-runner/internal/registry"
 	"go-python-runner/internal/runner"
@@ -15,7 +16,7 @@ type RunnerService struct {
 	manager  *runner.Manager
 	registry *registry.Registry
 	logger   *slog.Logger
-	app      *application.App
+	app      atomic.Pointer[application.App] // set after Wails init, read from goroutines
 }
 
 // NewRunnerService creates a new RunnerService.
@@ -30,7 +31,7 @@ func NewRunnerService(mgr *runner.Manager, reg *registry.Registry, logger *slog.
 // SetApp sets the Wails app reference for emitting events.
 // Called after app initialization.
 func (s *RunnerService) SetApp(app *application.App) {
-	s.app = app
+	s.app.Store(app)
 }
 
 // StartRun starts a script and returns the run ID.
@@ -42,7 +43,7 @@ func (s *RunnerService) StartRun(scriptID string, params map[string]string) (str
 
 	runID, msgCh, err := s.manager.StartRun(scriptID, params, script.Dir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("starting run for %s: %w", scriptID, err)
 	}
 
 	// Goroutine: read messages from the channel and emit Wails events
@@ -63,12 +64,13 @@ func (s *RunnerService) GetRunHistory() []runner.RunRecord {
 
 func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner.Message) {
 	for msg := range ch {
-		if s.app == nil {
+		app := s.app.Load()
+		if app == nil {
 			continue
 		}
 		switch m := msg.(type) {
 		case runner.OutputMsg:
-			s.app.Event.Emit("run:output", map[string]string{
+			app.Event.Emit("run:output", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"text":     m.Text,
@@ -80,7 +82,7 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"scriptID", scriptID,
 			)
 		case runner.ProgressMsg:
-			s.app.Event.Emit("run:progress", map[string]any{
+			app.Event.Emit("run:progress", map[string]any{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"current":  m.Current,
@@ -88,13 +90,13 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"label":    m.Label,
 			})
 		case runner.StatusMsg:
-			s.app.Event.Emit("run:status", map[string]string{
+			app.Event.Emit("run:status", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
-				"state":    m.State,
+				"state":    string(m.State),
 			})
 		case runner.ErrorMsg:
-			s.app.Event.Emit("run:error", map[string]string{
+			app.Event.Emit("run:error", map[string]string{
 				"runID":     runID,
 				"scriptID":  scriptID,
 				"message":   m.Message,

@@ -51,6 +51,24 @@ func (cm *CacheManager) Lookup(key string) (shmName string, size int64, found bo
 	return block.ShmName, block.Size, true
 }
 
+// LookupAndRef atomically looks up a cache block and adds a reference.
+// This avoids the TOCTOU race of separate Lookup + AddRef calls.
+func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size int64, found bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	block, ok := cm.blocks[key]
+	if !ok {
+		return "", 0, false
+	}
+	for _, ref := range block.Refs {
+		if ref == runID {
+			return block.ShmName, block.Size, true
+		}
+	}
+	block.Refs = append(block.Refs, runID)
+	return block.ShmName, block.Size, true
+}
+
 // AddRef adds a run ID reference to a cache block.
 func (cm *CacheManager) AddRef(key, runID string) {
 	cm.mu.Lock()
@@ -70,17 +88,20 @@ func (cm *CacheManager) AddRef(key, runID string) {
 
 // Release removes a run ID reference from a cache block.
 // If no references remain, the block is removed from the registry.
-func (cm *CacheManager) Release(key, runID string) {
+// Returns true if the runID was actually referencing the block, false otherwise.
+func (cm *CacheManager) Release(key, runID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	block, ok := cm.blocks[key]
 	if !ok {
-		return
+		return false
 	}
 	// Remove the runID from refs
+	found := false
 	for i, ref := range block.Refs {
 		if ref == runID {
 			block.Refs = append(block.Refs[:i], block.Refs[i+1:]...)
+			found = true
 			break
 		}
 	}
@@ -89,6 +110,7 @@ func (cm *CacheManager) Release(key, runID string) {
 	if len(block.Refs) == 0 {
 		delete(cm.blocks, key)
 	}
+	return found
 }
 
 // CleanupRun removes a terminated run's references from all cache blocks.

@@ -45,7 +45,7 @@ func TestPartialFailure(t *testing.T) {
 				t.Error("error message should include a traceback")
 			}
 		case runner.StatusMsg:
-			if m.State == "failed" {
+			if m.State == runner.StatusFailed {
 				hasFailed = true
 			}
 			t.Logf("Status: %s", m.State)

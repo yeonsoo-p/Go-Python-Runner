@@ -24,12 +24,13 @@ def setup_function() -> None:
 
 
 def _drain_messages(msg_iter: runner._MessageIterator, count: int) -> list[object]:
-    """Drain `count` messages from the iterator."""
+    """Drain `count` messages from the iterator (thread-safe)."""
     messages = []
-    for _ in range(count):
-        msg = msg_iter._queue.pop(0) if msg_iter._queue else None
-        if msg is not None:
-            messages.append(msg)
+    with msg_iter._condition:
+        for _ in range(count):
+            if not msg_iter._queue:
+                break
+            messages.append(msg_iter._queue.pop(0))
     return messages
 
 
