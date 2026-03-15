@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PYTHON_VERSION = "3.12"
+PYTHON_VERSION = "3.13"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 PYTHON_DIR = PROJECT_DIR / "python"
 INSTALL_DIR = PYTHON_DIR / "python"  # final location: python/python/python.exe

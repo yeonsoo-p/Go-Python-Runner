@@ -55,11 +55,19 @@ A native desktop application that orchestrates bundled Python scripts through a 
 
 ### Prerequisites
 
-- **Go** 1.23+
-- **Node.js** 20+
-- **uv** — Python toolchain (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **Go 1.25+** — [go.dev/dl](https://go.dev/dl)
+- **Node.js 22+** — [nodejs.org](https://nodejs.org)
+- **uv** — manages Python, deps, and protobuf codegen (no separate `protoc` needed)
+  - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+  - Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`
 - **Wails v3** — `go install github.com/wailsapp/wails/v3/cmd/wails3@latest`
-- **protoc** — Protocol Buffers compiler (for code generation)
+
+**Platform dependencies:**
+
+- **Windows:** [MinGW-w64](https://www.mingw-w64.org/) (GCC for CGO)
+- **Linux (Ubuntu/Debian):** `sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.0-dev`
+
+Run `wails3 doctor` to verify your environment is ready.
 
 ### Setup
 
