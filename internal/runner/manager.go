@@ -111,6 +111,10 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 // connectTimeout is the maximum time to wait for a Python script to connect via gRPC.
 const connectTimeout = 30 * time.Second
 
+// cancelGracePeriod is the time to wait for a script to exit gracefully after
+// receiving a CancelRequest before force-killing the process.
+const cancelGracePeriod = 3 * time.Second
+
 // waitAndSendStart waits for the Python script to connect, then sends start params.
 func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc *Process) {
 	select {
@@ -135,6 +139,10 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	exitCode, stderrOutput, err := proc.Wait()
 	endedAt := time.Now()
 
+	// Wait for gRPC stream to fully close so all Python messages
+	// (progress, error, status) are delivered before we synthesize a final status.
+	m.grpc.WaitStreamDone(runID, 5*time.Second)
+
 	finalStatus := StatusCompleted
 	if err != nil || exitCode != 0 {
 		finalStatus = StatusFailed
@@ -155,10 +163,22 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 		}
 	}
 
+	// Python's fail() sends a gRPC Error message but exits with code 0.
+	// Check the gotError flag before UnregisterRun clears the run channel.
+	if finalStatus != StatusFailed && m.grpc.GotError(runID) {
+		finalStatus = StatusFailed
+	}
+
+	// Guarantee frontend receives terminal status even if Python's
+	// gRPC StatusMsg was lost (stream error, race, etc.).
+	// The channel is buffered and frontend guards ignore duplicates.
+	m.grpc.TrySendStatus(runID, finalStatus)
+
 	m.cache.CleanupRun(runID)
 	m.grpc.UnregisterRun(runID)
 
 	m.mu.Lock()
+	recordStatus := finalStatus
 	if s, ok := m.activeRuns[runID]; ok {
 		if !s.Status.IsTerminal() {
 			s.Status = finalStatus
@@ -170,12 +190,13 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 				"source", "backend",
 			)
 		}
+		recordStatus = s.Status
 	}
 	delete(m.activeRuns, runID)
 	m.history = append(m.history, RunRecord{
 		RunID:     runID,
 		ScriptID:  scriptID,
-		Status:    finalStatus,
+		Status:    recordStatus,
 		StartedAt: startedAt,
 		EndedAt:   endedAt,
 	})
@@ -184,7 +205,7 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	m.logger.Info("run finished",
 		"runID", runID,
 		"scriptID", scriptID,
-		"status", finalStatus,
+		"status", recordStatus,
 		"exitCode", exitCode,
 		"source", "backend",
 	)
@@ -199,16 +220,18 @@ func (m *Manager) CancelRun(runID string) error {
 		return fmt.Errorf("run %s not found", runID)
 	}
 
-	// Try to send cancel via gRPC first (best-effort; process kill follows)
+	// Try to send cancel via gRPC first. If it fails, kill immediately.
+	// If it succeeds, give the script a grace window to exit cleanly.
 	if err := m.grpc.SendCancel(runID); err != nil {
-		m.logger.Debug("gRPC cancel failed, falling back to process kill", "runID", runID, "error", err.Error(), "source", "backend")
+		m.logger.Debug("gRPC cancel failed, killing process immediately", "runID", runID, "error", err.Error(), "source", "backend")
+		state.cancel()
+	} else {
+		// Grace window: let the script notice is_cancelled() and exit cleanly.
+		// If it doesn't exit in time, force-kill. cancel() is idempotent — if
+		// the process already exited via waitForExit, this is a no-op.
+		time.AfterFunc(cancelGracePeriod, state.cancel)
 	}
-
-	// state.cancel is proc.Cancel which calls context.CancelFunc — safe to call
-	// after the run is removed from activeRuns by waitForExit, since CancelFunc
-	// is idempotent and the GC keeps the state pointer alive.
-	state.cancel()
-	m.logger.Info("run cancelled", "runID", runID, "source", "backend")
+	m.logger.Info("run cancel requested", "runID", runID, "source", "backend")
 	return nil
 }
 

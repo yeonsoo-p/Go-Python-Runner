@@ -27,11 +27,13 @@ type LogFilter struct {
 // RingBuffer is a fixed-capacity circular buffer of LogEntry values.
 // It is safe for concurrent use.
 type RingBuffer struct {
-	mu      sync.RWMutex
-	entries []LogEntry
-	cap     int
-	head    int // next write position
-	count   int
+	mu       sync.RWMutex
+	entries  []LogEntry
+	cap      int
+	head     int // next write position
+	count    int
+	onPushMu sync.RWMutex
+	onPush   func(LogEntry) // called after each push, outside the write lock
 }
 
 // NewRingBuffer creates a ring buffer with the given capacity.
@@ -42,14 +44,28 @@ func NewRingBuffer(capacity int) *RingBuffer {
 	}
 }
 
+// SetOnPush registers a callback invoked after each Push, outside the write lock.
+func (r *RingBuffer) SetOnPush(fn func(LogEntry)) {
+	r.onPushMu.Lock()
+	defer r.onPushMu.Unlock()
+	r.onPush = fn
+}
+
 // Push adds an entry to the ring buffer, evicting the oldest if full.
 func (r *RingBuffer) Push(entry LogEntry) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.entries[r.head] = entry
 	r.head = (r.head + 1) % r.cap
 	if r.count < r.cap {
 		r.count++
+	}
+	r.mu.Unlock()
+
+	r.onPushMu.RLock()
+	fn := r.onPush
+	r.onPushMu.RUnlock()
+	if fn != nil {
+		fn(entry)
 	}
 }
 

@@ -17,7 +17,7 @@ bindings:
 
 # --- Testing ---
 
-test: test-go test-python test-frontend
+test: test-go test-python test-frontend test-integration
 
 test-go:
 	go test ./internal/...
@@ -39,8 +39,10 @@ lint-go:
 	go vet ./...
 
 lint-python:
-	uv run ruff check scripts/ tests/
+	uv run ruff check --fix scripts/ tests/
+	uv run ruff format scripts/ tests/
 	uv run mypy scripts/_lib/runner.py
+	uv run mypy scripts/_lib/tests
 
 lint-frontend:
 	cd frontend && npx tsc --noEmit

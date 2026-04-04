@@ -108,6 +108,19 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"scriptID", scriptID,
 				"traceback", m.Traceback,
 			)
+		case runner.DataMsg:
+			app.Event.Emit("run:data", map[string]any{
+				"runID":    runID,
+				"scriptID": scriptID,
+				"key":      m.Key,
+				"value":    m.Value,
+			})
+			s.logger.Info("script data result",
+				"key", m.Key,
+				"source", "python",
+				"runID", runID,
+				"scriptID", scriptID,
+			)
 		}
 	}
 }

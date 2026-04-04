@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Any
 
 # Add _lib to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -21,9 +22,13 @@ def setup_function() -> None:
     runner._stream = None
     runner._stub = None
     runner._cache_refs = {}
+    runner._cancel_event = runner.threading.Event()
+    runner._finished = False
+    runner._reader_thread = None
+    runner._reader_started = False
 
 
-def _drain_messages(msg_iter: runner._MessageIterator, count: int) -> list[object]:
+def _drain_messages(msg_iter: runner._MessageIterator, count: int) -> list[Any]:
     """Drain `count` messages from the iterator (thread-safe)."""
     messages = []
     with msg_iter._condition:
@@ -150,3 +155,50 @@ def test_progress_converts_types() -> None:
     assert msgs[0].HasField("progress")
     assert msgs[0].progress.current == 1
     assert msgs[0].progress.total == 10
+
+
+def test_is_cancelled_default_false() -> None:
+    """is_cancelled() returns False when no cancel has been received."""
+    assert runner.is_cancelled() is False
+
+
+def test_is_cancelled_after_event_set() -> None:
+    """is_cancelled() returns True after the cancel event is set."""
+    runner._cancel_event.set()
+    assert runner.is_cancelled() is True
+
+
+def test_send_raises_on_cancel() -> None:
+    """_send() raises CancelledError when the cancel event is set."""
+    import pytest
+
+    runner._cancel_event.set()
+    with pytest.raises(runner.CancelledError):
+        runner.output("should fail")
+
+
+def test_finish_is_idempotent() -> None:
+    """Calling _finish() twice does not raise."""
+    runner._finish()
+    runner._finish()  # second call is a no-op
+    assert runner._finished is True
+
+
+def test_send_noop_after_finish() -> None:
+    """_send() silently drops messages after _finish()."""
+    runner._finish()
+    runner.output("should be dropped")
+    msgs = _drain_messages(runner._msg_iter, 1)
+    assert len(msgs) == 0
+
+
+def test_fail_works_after_cancel() -> None:
+    """fail() bypasses cancel check so error+status are always delivered."""
+    runner._cancel_event.set()
+    runner.fail("cancelled by user", "no traceback")
+    msgs = _drain_messages(runner._msg_iter, 2)
+    assert len(msgs) == 2
+    assert msgs[0].HasField("error")
+    assert msgs[0].error.message == "cancelled by user"
+    assert msgs[1].HasField("status")
+    assert msgs[1].status.state == "failed"

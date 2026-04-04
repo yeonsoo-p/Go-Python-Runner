@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
@@ -43,6 +44,7 @@ type RunChannel struct {
 	cancel        chan struct{}
 	connected     chan struct{} // closed when Python connects
 	connectOnce   sync.Once    // prevents double-close on connected
+	streamDone    chan struct{} // closed when Execute() returns (all messages forwarded)
 	closed        bool         // true after UnregisterRun closes Messages
 	closedMu      sync.Mutex   // protects closed flag and channel sends
 	gotError      atomic.Bool  // true if an ErrorMsg was received via gRPC
@@ -125,9 +127,10 @@ func (s *GRPCServer) RegisterRun(runID string) <-chan Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ch := &RunChannel{
-		Messages:  make(chan Message, messageBufferSize),
-		cancel:    make(chan struct{}),
-		connected: make(chan struct{}),
+		Messages:   make(chan Message, messageBufferSize),
+		cancel:     make(chan struct{}),
+		connected:  make(chan struct{}),
+		streamDone: make(chan struct{}),
 	}
 	s.runs[runID] = ch
 	return ch.Messages
@@ -170,6 +173,21 @@ func (s *GRPCServer) WaitConnected(runID string) <-chan struct{} {
 		return c
 	}
 	return ch.connected
+}
+
+// WaitStreamDone blocks until the gRPC Execute() handler returns for the given run,
+// meaning all Python messages have been forwarded to the Messages channel.
+func (s *GRPCServer) WaitStreamDone(runID string, timeout time.Duration) {
+	s.mu.RLock()
+	ch, ok := s.runs[runID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	select {
+	case <-ch.streamDone:
+	case <-time.After(timeout):
+	}
 }
 
 // SendStart sends a StartRequest to the Python script for the given run.
@@ -235,6 +253,7 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 	ch.stream = stream
 	ch.connectOnce.Do(func() { close(ch.connected) })
 	s.mu.Unlock()
+	defer close(ch.streamDone)
 
 	s.logger.Info("Python client connected", "runID", runID, "source", "backend")
 
@@ -468,6 +487,19 @@ func (s *GRPCServer) TrySendError(runID, message string) {
 		return
 	}
 	ch.trySend(ErrorMsg{Message: message, Traceback: ""})
+}
+
+// TrySendStatus sends a final StatusMsg to a run's message channel.
+// Used by waitForExit to guarantee the frontend receives a terminal status
+// even if the Python→gRPC path failed to deliver one.
+func (s *GRPCServer) TrySendStatus(runID string, status RunStatus) {
+	s.mu.RLock()
+	ch, ok := s.runs[runID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	ch.trySend(StatusMsg{State: status})
 }
 
 // GotError returns whether the run received a structured error via gRPC.

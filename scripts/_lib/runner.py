@@ -39,6 +39,13 @@ _stream: Any = None
 _cache_refs: dict[str, shared_memory.SharedMemory] = {}
 _cache_owned: set[str] = set()  # keys created by this process (need unlink on cleanup)
 _run_id: str | None = None
+_cancel_event = threading.Event()
+_finished = False
+_reader_thread: threading.Thread | None = None
+
+
+class CancelledError(Exception):
+    """Raised when the script has been cancelled by the backend."""
 
 
 class _MessageIterator:
@@ -78,8 +85,12 @@ class _MessageIterator:
 _msg_iter = _MessageIterator()
 
 
-def _send(msg: Any) -> None:
+def _send(msg: Any, *, _force: bool = False) -> None:
     """Send a ClientMessage through the gRPC stream."""
+    if _finished and not _force:
+        return
+    if not _force and _cancel_event.is_set():
+        raise CancelledError("Script cancelled by backend")
     _msg_iter.put(msg)
 
 
@@ -96,7 +107,7 @@ _reader_started = False
 
 def _start_reader_thread() -> None:
     """Start a daemon thread that reads server messages into a queue."""
-    global _reader_started
+    global _reader_started, _reader_thread
     if _reader_started:
         return
     _reader_started = True
@@ -105,15 +116,18 @@ def _start_reader_thread() -> None:
         global _reader_error
         try:
             for msg in _stream:
-                _response_queue.put(msg)
+                if msg.HasField("cancel"):
+                    _cancel_event.set()
+                else:
+                    _response_queue.put(msg)
         except Exception as e:
             _reader_error = e
         finally:
             # Sentinel to unblock any waiting get()
             _response_queue.put(None)
 
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
+    _reader_thread = threading.Thread(target=_reader, daemon=True)
+    _reader_thread.start()
 
 
 def _recv_response(operation: str = "server response", timeout: float = _RESPONSE_TIMEOUT) -> Any:
@@ -125,8 +139,7 @@ def _recv_response(operation: str = "server response", timeout: float = _RESPONS
         msg = _response_queue.get(timeout=timeout)
     except queue.Empty:
         raise RuntimeError(
-            f"Timed out waiting for {operation} after {timeout}s "
-            "(possible deadlock in bidirectional stream)"
+            f"Timed out waiting for {operation} after {timeout}s (possible deadlock in bidirectional stream)"
         ) from None
     if msg is None:
         if _reader_error is not None:
@@ -164,32 +177,34 @@ def connect() -> dict[str, str]:
     if not start_msg.HasField("start"):
         raise RuntimeError(f"Expected StartRequest, got {start_msg}")
 
+    # Start reader thread so CancelRequest is intercepted for all scripts,
+    # not just those that call _recv_response() (cache_get, db_query, etc.).
+    _start_reader_thread()
+
     return dict(start_msg.start.params)
 
 
 def output(text: object) -> None:
     """Send an output message to Go."""
-    _send(runner_pb2.ClientMessage(
-        output=runner_pb2.Output(text=str(text))
-    ))
+    _send(runner_pb2.ClientMessage(output=runner_pb2.Output(text=str(text))))
 
 
 def progress(current: int, total: int, label: str = "") -> None:
     """Send a progress update to Go."""
-    _send(runner_pb2.ClientMessage(
-        progress=runner_pb2.Progress(
-            current=int(current),
-            total=int(total),
-            label=str(label),
+    _send(
+        runner_pb2.ClientMessage(
+            progress=runner_pb2.Progress(
+                current=int(current),
+                total=int(total),
+                label=str(label),
+            )
         )
-    ))
+    )
 
 
 def complete() -> None:
     """Send a completed status to Go and close the stream."""
-    _send(runner_pb2.ClientMessage(
-        status=runner_pb2.Status(state=STATUS_COMPLETED)
-    ))
+    _send(runner_pb2.ClientMessage(status=runner_pb2.Status(state=STATUS_COMPLETED)))
     _finish()
 
 
@@ -197,40 +212,37 @@ def fail(message: str, tb: str | None = None) -> None:
     """Send an error and failed status to Go."""
     if tb is None:
         tb = traceback.format_exc()
-    _send(runner_pb2.ClientMessage(
-        error=runner_pb2.Error(message=str(message), traceback=str(tb))
-    ))
-    _send(runner_pb2.ClientMessage(
-        status=runner_pb2.Status(state=STATUS_FAILED)
-    ))
+    _send(runner_pb2.ClientMessage(error=runner_pb2.Error(message=str(message), traceback=str(tb))), _force=True)
+    _send(runner_pb2.ClientMessage(status=runner_pb2.Status(state=STATUS_FAILED)), _force=True)
     _finish()
 
 
 def _finish() -> None:
     """Close send stream and block until Go confirms receipt (stream EOF)."""
-    _msg_iter.close()
-    if _stream is None:
+    global _finished
+    if _finished:
         return
-    # Drain server stream until EOF. Execute() only returns after it has
-    # Recv()'d all our messages, so this guarantees delivery.
-    try:
-        for _ in _stream:
-            pass
-    except grpc.RpcError as e:
-        status_code = e.code() if hasattr(e, "code") else "UNKNOWN"
-        details = e.details() if hasattr(e, "details") else str(e)
-        print(
-            f"[runner] WARNING: gRPC error during stream drain "
-            f"(status={status_code}): {details}",
-            file=sys.stderr,
-        )
+    _finished = True
+    _msg_iter.close()
+    # Wait for the reader thread to finish draining the server stream.
+    # Closing the iterator signals gRPC to close the client→server half;
+    # the server then closes its side, and the reader thread exits.
+    if _reader_thread is not None:
+        _reader_thread.join(timeout=5)
 
 
 def data_result(key: str, value: bytes) -> None:
     """Send a data result (binary) to Go."""
-    _send(runner_pb2.ClientMessage(
-        data=runner_pb2.DataResult(key=str(key), value=bytes(value))
-    ))
+    _send(runner_pb2.ClientMessage(data=runner_pb2.DataResult(key=str(key), value=bytes(value))))
+
+
+def is_cancelled() -> bool:
+    """Check if the Go backend has requested cancellation.
+
+    Scripts should poll this periodically in long-running loops
+    and exit gracefully when True.
+    """
+    return _cancel_event.is_set()
 
 
 # --- Shared Cache API ---
@@ -243,15 +255,17 @@ def cache_set(key: str, obj: object) -> None:
     try:
         if shm.buf is None:
             raise RuntimeError("SharedMemory buffer is None")
-        shm.buf[:len(data)] = data
+        shm.buf[: len(data)] = data
 
-        _send(runner_pb2.ClientMessage(
-            cache_create=runner_pb2.CacheCreate(
-                key=str(key),
-                size=len(data),
-                shm_name=shm.name,
+        _send(
+            runner_pb2.ClientMessage(
+                cache_create=runner_pb2.CacheCreate(
+                    key=str(key),
+                    size=len(data),
+                    shm_name=shm.name,
+                )
             )
-        ))
+        )
     except Exception:
         # Clean up the shared memory block if registration with Go failed
         with contextlib.suppress(OSError):
@@ -270,9 +284,7 @@ def cache_get(key: str) -> object:
         raise RuntimeError("not connected — call connect() first")
 
     # Send lookup request
-    _send(runner_pb2.ClientMessage(
-        cache_lookup=runner_pb2.CacheLookup(key=str(key))
-    ))
+    _send(runner_pb2.ClientMessage(cache_lookup=runner_pb2.CacheLookup(key=str(key))))
 
     # Wait for CacheInfo response from Go
     try:
@@ -289,7 +301,7 @@ def cache_get(key: str) -> object:
     shm = shared_memory.SharedMemory(name=info.shm_name)
     if shm.buf is None:
         raise RuntimeError("SharedMemory buffer is None")
-    obj = pickle.loads(bytes(shm.buf[:info.size]))
+    obj = pickle.loads(bytes(shm.buf[: info.size]))
     _cache_refs[key] = shm
     return obj
 
@@ -305,9 +317,7 @@ def cache_release(key: str) -> None:
                 shm.unlink()
             _cache_owned.discard(key)
 
-    _send(runner_pb2.ClientMessage(
-        cache_release=runner_pb2.CacheRelease(key=str(key))
-    ))
+    _send(runner_pb2.ClientMessage(cache_release=runner_pb2.CacheRelease(key=str(key))))
 
 
 # --- File Dialog API ---
@@ -331,18 +341,17 @@ def open_file_dialog(
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    proto_filters = [
-        runner_pb2.FileFilter(display_name=dn, pattern=pat)
-        for dn, pat in (filters or [])
-    ]
-    _send(runner_pb2.ClientMessage(
-        file_dialog=runner_pb2.FileDialogRequest(
-            type="open",
-            title=title,
-            directory=directory,
-            filters=proto_filters,
+    proto_filters = [runner_pb2.FileFilter(display_name=dn, pattern=pat) for dn, pat in (filters or [])]
+    _send(
+        runner_pb2.ClientMessage(
+            file_dialog=runner_pb2.FileDialogRequest(
+                type="open",
+                title=title,
+                directory=directory,
+                filters=proto_filters,
+            )
         )
-    ))
+    )
     try:
         resp = _recv_response("file dialog")
     except grpc.RpcError as e:
@@ -376,19 +385,18 @@ def save_file_dialog(
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    proto_filters = [
-        runner_pb2.FileFilter(display_name=dn, pattern=pat)
-        for dn, pat in (filters or [])
-    ]
-    _send(runner_pb2.ClientMessage(
-        file_dialog=runner_pb2.FileDialogRequest(
-            type="save",
-            title=title,
-            directory=directory,
-            filename=filename,
-            filters=proto_filters,
+    proto_filters = [runner_pb2.FileFilter(display_name=dn, pattern=pat) for dn, pat in (filters or [])]
+    _send(
+        runner_pb2.ClientMessage(
+            file_dialog=runner_pb2.FileDialogRequest(
+                type="save",
+                title=title,
+                directory=directory,
+                filename=filename,
+                filters=proto_filters,
+            )
         )
-    ))
+    )
     try:
         resp = _recv_response("save dialog")
     except grpc.RpcError as e:
@@ -421,12 +429,14 @@ def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    _send(runner_pb2.ClientMessage(
-        db_execute=runner_pb2.DbExecute(
-            sql=sql,
-            params=params or [],
+    _send(
+        runner_pb2.ClientMessage(
+            db_execute=runner_pb2.DbExecute(
+                sql=sql,
+                params=params or [],
+            )
         )
-    ))
+    )
 
     try:
         resp = _recv_response("db execute")
@@ -460,12 +470,14 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    _send(runner_pb2.ClientMessage(
-        db_query=runner_pb2.DbQuery(
-            sql=sql,
-            params=params or [],
+    _send(
+        runner_pb2.ClientMessage(
+            db_query=runner_pb2.DbQuery(
+                sql=sql,
+                params=params or [],
+            )
         )
-    ))
+    )
 
     try:
         resp = _recv_response("db query")
