@@ -114,20 +114,22 @@ func (cm *CacheManager) Release(key, runID string) bool {
 }
 
 // CleanupRun removes a terminated run's references from all cache blocks.
-// Unlike Release(), blocks are NOT auto-deleted when refs reach zero here —
-// they persist for future consumers. This distinction is intentional:
-// Release() is an explicit user action ("I'm done with this"), while
-// CleanupRun() is automatic cleanup ("this run ended, but others may still need the data").
-// Blocks are only deleted via explicit Release or app shutdown.
+// Blocks with zero remaining references are deleted from the registry.
+// On Windows, the OS reclaims shared memory when the last handle closes,
+// so keeping zero-ref blocks would leave stale metadata that causes
+// cache_get to report "found" for memory that no longer exists.
 func (cm *CacheManager) CleanupRun(runID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	for _, block := range cm.blocks {
+	for key, block := range cm.blocks {
 		for i, ref := range block.Refs {
 			if ref == runID {
 				block.Refs = append(block.Refs[:i], block.Refs[i+1:]...)
 				break
 			}
+		}
+		if len(block.Refs) == 0 {
+			delete(cm.blocks, key)
 		}
 	}
 }

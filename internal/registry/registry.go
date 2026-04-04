@@ -17,14 +17,24 @@ type Param struct {
 	Description string `json:"description"`
 }
 
+// ParallelConfig describes how a script supports one-click parallel dispatch.
+type ParallelConfig struct {
+	DefaultWorkers int      `json:"default_workers"`
+	MaxWorkers     int      `json:"max_workers"`
+	VaryParam      string   `json:"vary_param"`
+	ChainParam     string   `json:"chain_param,omitempty"`
+	Names          []string `json:"names,omitempty"`
+}
+
 // Script represents a registered script (builtin or plugin).
 type Script struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	Params      []Param `json:"params"`
-	Source      string  `json:"source"` // "builtin" or "plugin"
-	Dir         string  `json:"-"`      // absolute path to script directory
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Params      []Param         `json:"params"`
+	Parallel    *ParallelConfig `json:"parallel,omitempty"`
+	Source      string          `json:"source"` // "builtin" or "plugin"
+	Dir         string          `json:"-"`      // absolute path to script directory
 }
 
 // Registry discovers and stores scripts from builtin and plugin directories.

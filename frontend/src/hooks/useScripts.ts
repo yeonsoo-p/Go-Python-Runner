@@ -14,12 +14,14 @@ export interface RunState {
   output: string[]
   progress: { current: number; total: number; label: string } | null
   error: { message: string; traceback: string } | null
+  data: Record<string, string> | null
 }
 
 interface OutputEvent { runID: string; scriptID: string; text: string }
 interface ProgressEvent { runID: string; scriptID: string; current: number; total: number; label: string }
 interface StatusEvent { runID: string; scriptID: string; state: RunStatus }
 interface ErrorEvent { runID: string; scriptID: string; message: string; traceback: string }
+interface DataEvent { runID: string; scriptID: string; key: string; value: string }
 
 export function useScripts() {
   const [scripts, setScripts] = useState<Script[]>([])
@@ -68,7 +70,7 @@ export function useScripts() {
               const next = new Map(prev)
               const run = next.get(data.runID) || {
                 runID: data.runID, scriptID: data.scriptID,
-                status: defaultStatus, output: [], progress: null, error: null,
+                status: defaultStatus, output: [], progress: null, error: null, data: null,
               }
               updater(run, data)
               next.set(data.runID, run)
@@ -94,8 +96,12 @@ export function useScripts() {
           run.error = { message: data.message, traceback: data.traceback }
           run.status = 'failed'
         })
+        const onData = onRunEvent<DataEvent>('run:data', 'running', (run, data) => {
+          // Go []byte is JSON-marshaled as a base64 string by Wails.
+          run.data = { ...(run.data || {}), [data.key]: data.value }
+        })
 
-        cleanup = [onOutput, onProgress, onStatus, onError].map(unsub => () => unsub())
+        cleanup = [onOutput, onProgress, onStatus, onError, onData].map(unsub => () => unsub())
       } catch (e) {
         console.warn('Failed to set up events:', e)
       }
@@ -115,9 +121,13 @@ export function useScripts() {
         const runID = await bindings.RunnerService.StartRun(scriptID, params)
         setRuns(prev => {
           const next = new Map(prev)
-          next.set(runID, {
-            runID, scriptID, status: 'running', output: [], progress: null, error: null,
-          })
+          // Don't overwrite if event handlers already populated this run
+          // (fast scripts can emit events before StartRun returns).
+          if (!next.has(runID)) {
+            next.set(runID, {
+              runID, scriptID, status: 'running', output: [], progress: null, error: null, data: null,
+            })
+          }
           return next
         })
         return runID
@@ -136,7 +146,45 @@ export function useScripts() {
         const next = new Map(prev)
         next.set(errorRunID, {
           runID: errorRunID, scriptID, status: 'failed', output: [],
-          progress: null, error: { message: `Failed to start: ${msg}`, traceback: '' },
+          progress: null, error: { message: `Failed to start: ${msg}`, traceback: '' }, data: null,
+        })
+        return next
+      })
+    }
+    return null
+  }, [])
+
+  const startParallelRuns = useCallback(async (scriptID: string, params: Record<string, string>, workerCount: number) => {
+    try {
+      const bindings = await import('../../bindings/go-python-runner/internal/services')
+      if (bindings.RunnerService?.StartParallelRuns) {
+        const runIDs: string[] = await bindings.RunnerService.StartParallelRuns(scriptID, params, workerCount)
+        setRuns(prev => {
+          const next = new Map(prev)
+          for (const runID of runIDs) {
+            if (!next.has(runID)) {
+              next.set(runID, {
+                runID, scriptID, status: 'running', output: [], progress: null, error: null, data: null,
+              })
+            }
+          }
+          return next
+        })
+        return runIDs
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      console.error('Failed to start parallel runs:', e)
+      try {
+        const svc = await import('../../bindings/go-python-runner/internal/services')
+        svc.LogService?.LogError?.('frontend', `Failed to start parallel runs: ${msg}`, { scriptID })
+      } catch { /* bindings not available */ }
+      const errorRunID = `error-${Date.now()}`
+      setRuns(prev => {
+        const next = new Map(prev)
+        next.set(errorRunID, {
+          runID: errorRunID, scriptID, status: 'failed', output: [],
+          progress: null, error: { message: `Failed to start parallel runs: ${msg}`, traceback: '' }, data: null,
         })
         return next
       })
@@ -160,5 +208,5 @@ export function useScripts() {
     }
   }, [])
 
-  return { scripts, runs, loading, loadError, startRun, cancelRun }
+  return { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun }
 }

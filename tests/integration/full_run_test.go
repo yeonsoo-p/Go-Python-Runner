@@ -28,7 +28,7 @@ func testSetup(t *testing.T) (*runner.Manager, *runner.GRPCServer, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := runner.NewManager(grpcServer, cache, logger)
+	mgr := runner.NewManager(grpcServer, cache, store, logger)
 
 	// Find Python from project root .venv
 	projectRoot, _ := filepath.Abs(filepath.Join("..", ".."))

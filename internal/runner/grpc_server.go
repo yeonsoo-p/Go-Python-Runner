@@ -47,7 +47,9 @@ type RunChannel struct {
 	streamDone    chan struct{} // closed when Execute() returns (all messages forwarded)
 	closed        bool         // true after UnregisterRun closes Messages
 	closedMu      sync.Mutex   // protects closed flag and channel sends
-	gotError      atomic.Bool  // true if an ErrorMsg was received via gRPC
+	gotError        atomic.Bool  // true if an ErrorMsg was received via gRPC
+	gotFailedStatus atomic.Bool  // true if a StatusMsg with state "failed" was received
+	errorMessage    atomic.Value // stores the last ErrorMsg text (string) for DB persistence
 }
 
 // DialogHandler opens native file dialogs. Implemented by the Wails app layer.
@@ -289,9 +291,13 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Label:   m.Progress.Label,
 		})
 	case *pb.ClientMessage_Status:
+		if m.Status.State == string(StatusFailed) {
+			ch.gotFailedStatus.Store(true)
+		}
 		ch.trySend(StatusMsg{State: RunStatus(m.Status.State)})
 	case *pb.ClientMessage_Error:
 		ch.gotError.Store(true)
+		ch.errorMessage.Store(m.Error.Message)
 		ch.trySend(ErrorMsg{
 			Message:   m.Error.Message,
 			Traceback: m.Error.Traceback,
@@ -511,6 +517,31 @@ func (s *GRPCServer) GotError(runID string) bool {
 		return false
 	}
 	return ch.gotError.Load()
+}
+
+// GotFailedStatus returns whether the run received a "failed" StatusMsg via gRPC.
+func (s *GRPCServer) GotFailedStatus(runID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ch, ok := s.runs[runID]
+	if !ok {
+		return false
+	}
+	return ch.gotFailedStatus.Load()
+}
+
+// ErrorMessage returns the last structured error message text received via gRPC, if any.
+func (s *GRPCServer) ErrorMessage(runID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ch, ok := s.runs[runID]
+	if !ok {
+		return ""
+	}
+	if v := ch.errorMessage.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
 }
 
 // Stop gracefully shuts down the gRPC server.

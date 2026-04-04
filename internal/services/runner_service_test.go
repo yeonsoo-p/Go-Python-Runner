@@ -38,7 +38,7 @@ func TestRunnerService_CancelRun_NotFound(t *testing.T) {
 	}
 	defer grpcSrv.Stop()
 
-	mgr := runner.NewManager(grpcSrv, cache, testLogger())
+	mgr := runner.NewManager(grpcSrv, cache, testDB(t), testLogger())
 	reg := registry.New(testLogger())
 	svc := NewRunnerService(mgr, reg, testLogger())
 
@@ -56,7 +56,7 @@ func TestRunnerService_GetRunHistory_Empty(t *testing.T) {
 	}
 	defer grpcSrv.Stop()
 
-	mgr := runner.NewManager(grpcSrv, cache, testLogger())
+	mgr := runner.NewManager(grpcSrv, cache, testDB(t), testLogger())
 	reg := registry.New(testLogger())
 	svc := NewRunnerService(mgr, reg, testLogger())
 

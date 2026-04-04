@@ -315,6 +315,14 @@ func TestGRPCServer_ErrorMessage(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for error message")
 	}
+
+	// Verify the accessor methods that waitForExit relies on for DB persistence.
+	if got := srv.ErrorMessage("run-err"); got != "something broke" {
+		t.Errorf("ErrorMessage() = %q, want %q", got, "something broke")
+	}
+	if !srv.GotError("run-err") {
+		t.Error("expected GotError to return true")
+	}
 }
 
 func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {

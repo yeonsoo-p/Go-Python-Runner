@@ -1,12 +1,15 @@
 package runner
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
+	"go-python-runner/internal/db"
 )
 
 // maxStderrLog is the maximum number of bytes of stderr output to log.
@@ -52,17 +55,48 @@ type Manager struct {
 	history    []RunRecord
 	grpc       *GRPCServer
 	cache      *CacheManager
+	db         *db.DB
 	logger     *slog.Logger
 	PythonPath string // optional override for python path
 }
 
 // NewManager creates a new process manager.
-func NewManager(grpc *GRPCServer, cache *CacheManager, logger *slog.Logger) *Manager {
-	return &Manager{
+// If store is non-nil, persisted run history is loaded from SQLite.
+func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, logger *slog.Logger) *Manager {
+	mgr := &Manager{
 		activeRuns: make(map[string]*RunState),
 		grpc:       grpc,
 		cache:      cache,
+		db:         store,
 		logger:     logger,
+	}
+	if store != nil {
+		mgr.loadHistory()
+	}
+	return mgr
+}
+
+// loadHistory populates the in-memory history slice from the SQLite runs table.
+func (m *Manager) loadHistory() {
+	rows, err := m.db.Query(
+		"SELECT id, script_id, status, started_at, finished_at FROM runs " +
+			"WHERE status IN ('completed', 'failed') ORDER BY started_at DESC",
+	)
+	if err != nil {
+		m.logger.Warn("failed to load run history from database", "error", err.Error(), "source", "backend")
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rec RunRecord
+		var status string
+		if err := rows.Scan(&rec.RunID, &rec.ScriptID, &status, &rec.StartedAt, &rec.EndedAt); err != nil {
+			m.logger.Warn("failed to scan run history row", "error", err.Error(), "source", "backend")
+			continue
+		}
+		rec.Status = RunStatus(status)
+		m.history = append(m.history, rec)
 	}
 }
 
@@ -101,6 +135,17 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 		"scriptID", scriptID,
 		"source", "backend",
 	)
+
+	// Persist initial run record to SQLite for history across restarts.
+	if m.db != nil {
+		paramsJSON, _ := json.Marshal(params)
+		if _, err := m.db.Exec(
+			"INSERT INTO runs (id, script_id, status, params, started_at) VALUES (?, ?, ?, ?, ?)",
+			runID, scriptID, string(StatusRunning), string(paramsJSON), startedAt,
+		); err != nil {
+			m.logger.Warn("failed to record run start", "runID", runID, "error", err.Error(), "source", "backend")
+		}
+	}
 
 	go m.waitAndSendStart(runID, params, proc)
 	go m.waitForExit(runID, scriptID, startedAt, proc)
@@ -169,10 +214,31 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 		finalStatus = StatusFailed
 	}
 
+	// Honor Python's explicit StatusMsg "failed" even without an ErrorMsg.
+	if finalStatus != StatusFailed && m.grpc.GotFailedStatus(runID) {
+		finalStatus = StatusFailed
+	}
+
 	// Guarantee frontend receives terminal status even if Python's
 	// gRPC StatusMsg was lost (stream error, race, etc.).
 	// The channel is buffered and frontend guards ignore duplicates.
 	m.grpc.TrySendStatus(runID, finalStatus)
+
+	// Capture structured error message before UnregisterRun clears the RunChannel.
+	// Priority: stderr (unstructured crash) > gRPC ErrorMsg (structured fail()) > process error.
+	var errorMessage string
+	if finalStatus == StatusFailed {
+		if stderrOutput != "" {
+			errorMessage = stderrOutput
+			if len(errorMessage) > maxStderrLog {
+				errorMessage = errorMessage[:maxStderrLog] + "\n... (truncated)"
+			}
+		} else if msg := m.grpc.ErrorMessage(runID); msg != "" {
+			errorMessage = msg
+		} else if err != nil {
+			errorMessage = err.Error()
+		}
+	}
 
 	m.cache.CleanupRun(runID)
 	m.grpc.UnregisterRun(runID)
@@ -201,6 +267,16 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 		EndedAt:   endedAt,
 	})
 	m.mu.Unlock()
+
+	// Update the persistent run record in SQLite.
+	if m.db != nil {
+		if _, dbErr := m.db.Exec(
+			"UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error_message = ? WHERE id = ?",
+			string(recordStatus), endedAt, exitCode, errorMessage, runID,
+		); dbErr != nil {
+			m.logger.Warn("failed to update run record", "runID", runID, "error", dbErr.Error(), "source", "backend")
+		}
+	}
 
 	m.logger.Info("run finished",
 		"runID", runID,

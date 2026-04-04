@@ -22,6 +22,14 @@ func Open(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
+	// For in-memory databases, restrict to a single connection so all
+	// queries use the same underlying database. Without this, Go's sql.DB
+	// connection pool may open multiple connections, each with its own
+	// independent in-memory database.
+	if dsn == ":memory:" {
+		db.SetMaxOpenConns(1)
+	}
+
 	// Set pragmas for performance and correctness.
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",

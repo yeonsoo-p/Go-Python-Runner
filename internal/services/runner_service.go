@@ -52,6 +52,71 @@ func (s *RunnerService) StartRun(scriptID string, params map[string]string) (str
 	return runID, nil
 }
 
+// StartParallelRuns starts multiple instances of a parallel-capable script.
+// Each instance gets a unique name via the script's VaryParam and is chained
+// via ChainParam so that worker[i] reads from worker[i-1].
+func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]string, workerCount int) ([]string, error) {
+	script, ok := s.registry.Get(scriptID)
+	if !ok {
+		return nil, fmt.Errorf("script not found: %s", scriptID)
+	}
+	if script.Parallel == nil {
+		return nil, fmt.Errorf("script %s does not support parallel execution", scriptID)
+	}
+
+	pc := script.Parallel
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > pc.MaxWorkers {
+		workerCount = pc.MaxWorkers
+	}
+
+	var runIDs []string
+	for i := 0; i < workerCount; i++ {
+		// Clone params so each worker gets its own copy.
+		wp := make(map[string]string, len(params)+2)
+		for k, v := range params {
+			wp[k] = v
+		}
+
+		// Assign unique worker name.
+		if i < len(pc.Names) {
+			wp[pc.VaryParam] = pc.Names[i]
+		} else {
+			wp[pc.VaryParam] = fmt.Sprintf("Worker-%d", i+1)
+		}
+
+		// Auto-chain: worker[i] reads from worker[i-1].
+		if pc.ChainParam != "" {
+			if i > 0 {
+				wp[pc.ChainParam] = wp[pc.VaryParam] // will be overwritten below
+				if i-1 < len(pc.Names) {
+					wp[pc.ChainParam] = pc.Names[i-1]
+				} else {
+					wp[pc.ChainParam] = fmt.Sprintf("Worker-%d", i)
+				}
+			} else {
+				wp[pc.ChainParam] = ""
+			}
+		}
+
+		runID, msgCh, err := s.manager.StartRun(scriptID, wp, script.Dir)
+		if err != nil {
+			// Cancel already-started runs on failure.
+			for _, id := range runIDs {
+				_ = s.manager.CancelRun(id)
+			}
+			return nil, fmt.Errorf("starting worker %d for %s: %w", i, scriptID, err)
+		}
+
+		go s.forwardMessages(runID, scriptID, msgCh)
+		runIDs = append(runIDs, runID)
+	}
+
+	return runIDs, nil
+}
+
 // CancelRun cancels a running script.
 func (s *RunnerService) CancelRun(runID string) error {
 	return s.manager.CancelRun(runID)

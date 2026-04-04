@@ -42,6 +42,7 @@ _run_id: str | None = None
 _cancel_event = threading.Event()
 _finished = False
 _reader_thread: threading.Thread | None = None
+_request_lock = threading.Lock()  # serializes send+recv pairs for thread safety
 
 
 class CancelledError(Exception):
@@ -283,22 +284,28 @@ def cache_get(key: str) -> object:
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    # Send lookup request
-    _send(runner_pb2.ClientMessage(cache_lookup=runner_pb2.CacheLookup(key=str(key))))
+    # Lock ensures no other thread can interleave its own send+recv on the shared stream.
+    with _request_lock:
+        _send(runner_pb2.ClientMessage(cache_lookup=runner_pb2.CacheLookup(key=str(key))))
 
-    # Wait for CacheInfo response from Go
+        try:
+            resp = _recv_response("cache lookup")
+        except grpc.RpcError as e:
+            raise RuntimeError(f"Lost connection while waiting for cache info: {e}") from e
+        if not resp.HasField("cache_info"):
+            raise RuntimeError(f"Expected CacheInfo response, got {resp}")
+
+        info = resp.cache_info
+        if not info.found:
+            raise KeyError(f"Cache key not found: {key}")
+
     try:
-        resp = _recv_response("cache lookup")
-    except grpc.RpcError as e:
-        raise RuntimeError(f"Lost connection while waiting for cache info: {e}") from e
-    if not resp.HasField("cache_info"):
-        raise RuntimeError(f"Expected CacheInfo response, got {resp}")
-
-    info = resp.cache_info
-    if not info.found:
-        raise KeyError(f"Cache key not found: {key}")
-
-    shm = shared_memory.SharedMemory(name=info.shm_name)
+        shm = shared_memory.SharedMemory(name=info.shm_name)
+    except FileNotFoundError:
+        raise KeyError(
+            f"Cache key '{key}' found in registry but shared memory '{info.shm_name}' "
+            f"is no longer available (reclaimed by OS after owning process exited)"
+        ) from None
     if shm.buf is None:
         raise RuntimeError("SharedMemory buffer is None")
     obj = pickle.loads(bytes(shm.buf[: info.size]))
@@ -342,22 +349,23 @@ def open_file_dialog(
         raise RuntimeError("not connected — call connect() first")
 
     proto_filters = [runner_pb2.FileFilter(display_name=dn, pattern=pat) for dn, pat in (filters or [])]
-    _send(
-        runner_pb2.ClientMessage(
-            file_dialog=runner_pb2.FileDialogRequest(
-                type="open",
-                title=title,
-                directory=directory,
-                filters=proto_filters,
+    with _request_lock:
+        _send(
+            runner_pb2.ClientMessage(
+                file_dialog=runner_pb2.FileDialogRequest(
+                    type="open",
+                    title=title,
+                    directory=directory,
+                    filters=proto_filters,
+                )
             )
         )
-    )
-    try:
-        resp = _recv_response("file dialog")
-    except grpc.RpcError as e:
-        raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
-    if not resp.HasField("file_dialog_response"):
-        raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+        try:
+            resp = _recv_response("file dialog")
+        except grpc.RpcError as e:
+            raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
+        if not resp.HasField("file_dialog_response"):
+            raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
     if resp.file_dialog_response.error:
         raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
     if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
@@ -386,23 +394,24 @@ def save_file_dialog(
         raise RuntimeError("not connected — call connect() first")
 
     proto_filters = [runner_pb2.FileFilter(display_name=dn, pattern=pat) for dn, pat in (filters or [])]
-    _send(
-        runner_pb2.ClientMessage(
-            file_dialog=runner_pb2.FileDialogRequest(
-                type="save",
-                title=title,
-                directory=directory,
-                filename=filename,
-                filters=proto_filters,
+    with _request_lock:
+        _send(
+            runner_pb2.ClientMessage(
+                file_dialog=runner_pb2.FileDialogRequest(
+                    type="save",
+                    title=title,
+                    directory=directory,
+                    filename=filename,
+                    filters=proto_filters,
+                )
             )
         )
-    )
-    try:
-        resp = _recv_response("save dialog")
-    except grpc.RpcError as e:
-        raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
-    if not resp.HasField("file_dialog_response"):
-        raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
+        try:
+            resp = _recv_response("save dialog")
+        except grpc.RpcError as e:
+            raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
+        if not resp.HasField("file_dialog_response"):
+            raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
     if resp.file_dialog_response.error:
         raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
     if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
@@ -429,21 +438,22 @@ def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    _send(
-        runner_pb2.ClientMessage(
-            db_execute=runner_pb2.DbExecute(
-                sql=sql,
-                params=params or [],
+    with _request_lock:
+        _send(
+            runner_pb2.ClientMessage(
+                db_execute=runner_pb2.DbExecute(
+                    sql=sql,
+                    params=params or [],
+                )
             )
         )
-    )
 
-    try:
-        resp = _recv_response("db execute")
-    except grpc.RpcError as e:
-        raise RuntimeError(f"Lost connection while waiting for db result: {e}") from e
-    if not resp.HasField("db_result"):
-        raise RuntimeError(f"Expected DbResult response, got {resp}")
+        try:
+            resp = _recv_response("db execute")
+        except grpc.RpcError as e:
+            raise RuntimeError(f"Lost connection while waiting for db result: {e}") from e
+        if not resp.HasField("db_result"):
+            raise RuntimeError(f"Expected DbResult response, got {resp}")
 
     if resp.db_result.error:
         raise RuntimeError(f"SQL error: {resp.db_result.error}")
@@ -470,21 +480,22 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
 
-    _send(
-        runner_pb2.ClientMessage(
-            db_query=runner_pb2.DbQuery(
-                sql=sql,
-                params=params or [],
+    with _request_lock:
+        _send(
+            runner_pb2.ClientMessage(
+                db_query=runner_pb2.DbQuery(
+                    sql=sql,
+                    params=params or [],
+                )
             )
         )
-    )
 
-    try:
-        resp = _recv_response("db query")
-    except grpc.RpcError as e:
-        raise RuntimeError(f"Lost connection while waiting for db query result: {e}") from e
-    if not resp.HasField("db_query_result"):
-        raise RuntimeError(f"Expected DbQueryResult response, got {resp}")
+        try:
+            resp = _recv_response("db query")
+        except grpc.RpcError as e:
+            raise RuntimeError(f"Lost connection while waiting for db query result: {e}") from e
+        if not resp.HasField("db_query_result"):
+            raise RuntimeError(f"Expected DbQueryResult response, got {resp}")
 
     if resp.db_query_result.error:
         raise RuntimeError(f"SQL error: {resp.db_query_result.error}")

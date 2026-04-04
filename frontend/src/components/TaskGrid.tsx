@@ -1,8 +1,17 @@
+import { useCallback } from 'react'
 import { useScripts } from '../hooks/useScripts'
 import TaskCard from './TaskCard'
 
 function TaskGrid() {
-  const { scripts, runs, loading, loadError, startRun, cancelRun } = useScripts()
+  const { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun } = useScripts()
+
+  const handleStartRun = useCallback(async (scriptID: string, params: Record<string, string>, workerCount?: number) => {
+    if (workerCount && workerCount > 1) {
+      await startParallelRuns(scriptID, params, workerCount)
+    } else {
+      await startRun(scriptID, params)
+    }
+  }, [startRun, startParallelRuns])
 
   if (loading) {
     return (
@@ -39,7 +48,7 @@ function TaskGrid() {
             key={script.id}
             script={script}
             runs={scriptRuns}
-            onStartRun={startRun}
+            onStartRun={handleStartRun}
             onCancelRun={cancelRun}
           />
         )

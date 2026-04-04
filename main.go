@@ -85,7 +85,7 @@ func main() {
 	}()
 
 	// Initialize process manager
-	mgr := runner.NewManager(grpcServer, cache, logger)
+	mgr := runner.NewManager(grpcServer, cache, store, logger)
 
 	// Create Wails services
 	scriptSvc := services.NewScriptService(reg)

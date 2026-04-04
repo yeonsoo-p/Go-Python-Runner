@@ -78,13 +78,17 @@ func TestCacheManager_CleanupRun(t *testing.T) {
 
 	cm.CleanupRun("run-1")
 
-	// All blocks persist after cleanup (available for future consumers).
-	// CleanupRun only removes the run's refs, not the blocks themselves.
+	// Zero-ref blocks (block1, block2) should be deleted.
+	// On Windows, shared memory is reclaimed when the last handle closes,
+	// so keeping zero-ref blocks would leave stale registry entries.
 	_, _, found1 := cm.Lookup("block1")
 	_, _, found2 := cm.Lookup("block2")
 	_, _, found3 := cm.Lookup("block3")
-	if !found1 || !found2 || !found3 {
-		t.Error("expected all blocks to persist after CleanupRun")
+	if found1 || found2 {
+		t.Error("expected zero-ref blocks to be deleted after CleanupRun")
+	}
+	if !found3 {
+		t.Error("expected block3 to persist (still has run-2 ref)")
 	}
 
 	// block3 should have run-2's ref remaining
@@ -92,26 +96,22 @@ func TestCacheManager_CleanupRun(t *testing.T) {
 	if len(blocks["block3"].Refs) != 1 || blocks["block3"].Refs[0] != "run-2" {
 		t.Errorf("expected block3 to have only run-2 ref, got %v", blocks["block3"].Refs)
 	}
-
-	// block1 should have zero refs but still exist
-	if len(blocks["block1"].Refs) != 0 {
-		t.Errorf("expected block1 to have zero refs, got %v", blocks["block1"].Refs)
-	}
 }
 
 func TestCacheManager_ExplicitRelease(t *testing.T) {
 	cm := NewCacheManager()
 	cm.Register("data", "shm_x", 100, "run-1")
+	cm.AddRef("data", "run-2")
 
-	// CleanupRun removes ref but block persists
+	// CleanupRun removes run-1's ref; block persists because run-2 still holds a ref
 	cm.CleanupRun("run-1")
 	_, _, found := cm.Lookup("data")
 	if !found {
-		t.Error("expected block to persist after CleanupRun")
+		t.Error("expected block to persist after CleanupRun (run-2 still has ref)")
 	}
 
-	// Explicit Release with zero refs deletes the block
-	cm.Release("data", "any")
+	// Explicit Release of run-2 deletes the block (zero refs)
+	cm.Release("data", "run-2")
 	_, _, found = cm.Lookup("data")
 	if found {
 		t.Error("expected block to be deleted after explicit Release with zero refs")
