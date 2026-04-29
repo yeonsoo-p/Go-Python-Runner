@@ -83,7 +83,7 @@ func (p *Process) Start() error {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
-	hideConsole(p.cmd)
+	HideConsole(p.cmd)
 
 	if err := p.cmd.Start(); err != nil {
 		return fmt.Errorf("starting process: %w", err)
