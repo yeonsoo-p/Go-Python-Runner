@@ -3,7 +3,7 @@ import { useScripts } from '../hooks/useScripts'
 import TaskCard from './TaskCard'
 
 function TaskGrid() {
-  const { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun } = useScripts()
+  const { scripts, runs, groups, loading, loadError, startRun, startParallelRuns, cancelRun, cancelGroup } = useScripts()
 
   const handleStartRun = useCallback(async (scriptID: string, params: Record<string, string>, workerCount?: number) => {
     if (workerCount && workerCount > 1) {
@@ -46,13 +46,18 @@ function TaskGrid() {
             const scriptRuns = Array.from(runs.values()).filter(
               (r) => r.scriptID === script.id
             )
+            const scriptGroups = Array.from(groups.values()).filter(
+              (g) => g.scriptID === script.id
+            )
             return (
               <TaskCard
                 key={script.id}
                 script={script}
                 runs={scriptRuns}
+                groups={scriptGroups}
                 onStartRun={handleStartRun}
                 onCancelRun={cancelRun}
+                onCancelGroup={cancelGroup}
               />
             )
           })}

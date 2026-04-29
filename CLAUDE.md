@@ -15,7 +15,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 9. **Python deps**: Shared base (`grpcio`, `protobuf`, `numpy`) — managed by `uv` in dev, pre-installed at build time for distribution
 10. **Logging**: Unified structured logging via Go `log/slog` — frontend, backend, and Python errors all funnel into one system
 11. **Plugin system**: User-writable script directory that can override built-in scripts or add new ones post-build
-12. **Testing**: Three tiers — unit tests (isolated, fast), service tests (real deps, no full app), integration tests (end-to-end Go-Python)
+12. **Testing**: Tiered — unit (isolated, fast), service (real deps, no full app), integration (end-to-end Go ↔ Python, build-tagged), stress (high-volume / concurrency, build-tagged)
 13. **Shared cache**: Parallel scripts share any Python object via `multiprocessing.shared_memory` + pickle. Go manages lifecycle (registry, ref counting, cleanup).
 14. **Error handling**: Every failure flows through one ingress — `internal/notify.Reservoir.Report(Event)` — which routes by severity × persistence to slog (file + ring buffer + LogViewer) AND a UI surface (toast, banner, streamed pane, or full-screen pane). Services hold *only* `notify.Reservoir`; `*slog.Logger` exists only in `main.go` and `internal/notify`. See § Error Handling for the four-part contract and the routing matrix.
 15. **Plugin authoring loop**: Catalog hot-reloads on filesystem changes via fsnotify; malformed plugins surface as `LoadIssue` records, not silent skips. Scripts can be opened in the OS default handler from the UI.
@@ -45,134 +45,6 @@ A native desktop application that orchestrates bundled Python scripts through a 
 │  - Helper library (fail/warn/    │
 │    info carry Severity enum)     │
 └──────────────────────────────────┘
-```
-
-## Project Structure
-
-```text
-go-python-runner/
-├── main.go                        # Wails v3 app entry
-├── go.mod / go.sum
-├── pyproject.toml                 # Python version pin + dev deps (uv)
-├── uv.lock                        # Reproducible Python lockfile
-├── proto/
-│   └── runner.proto               # Protobuf service + message definitions
-├── internal/
-│   ├── notify/                    # Central error reservoir (the single
-│   │   ├── notify.go               # ingress every error flows through;
-│   │   ├── notify_test.go          # owns severity × persistence routing
-│   │   └── testing.go              # to slog + Wails events)
-│   ├── services/
-│   │   ├── script_service.go      # Wails service: list/get scripts
-│   │   ├── script_service_test.go
-│   │   ├── runner_service.go      # Wails service: start/cancel/status
-│   │   ├── runner_service_test.go
-│   │   ├── log_service.go         # Wails service: receive frontend errors, expose logs
-│   │   └── log_service_test.go
-│   ├── db/
-│   │   ├── db.go                  # SQLite database: run history + key-value store
-│   │   └── db_test.go
-│   ├── runner/
-│   │   ├── manager.go             # Process lifecycle, typed channels, RunStatus type
-│   │   ├── process.go             # Single subprocess: spawn, gRPC, wait
-│   │   ├── process_windows.go     # Windows-specific process handling
-│   │   ├── process_other.go       # Linux/macOS process handling
-│   │   ├── grpc_server.go         # gRPC server for Python clients
-│   │   ├── grpc_server_test.go
-│   │   ├── cache.go               # Shared memory cache manager (registry + lifecycle)
-│   │   └── cache_test.go
-│   ├── registry/
-│   │   ├── registry.go            # Discover scripts from builtin + plugin dirs
-│   │   └── registry_test.go
-│   ├── logging/
-│   │   ├── logger.go              # slog multi-handler: file + ring buffer
-│   │   ├── logger_test.go
-│   │   ├── ring.go                # In-memory ring buffer for UI access
-│   │   └── ring_test.go
-│   └── gen/                       # Generated protobuf Go code
-│       ├── runner.pb.go
-│       └── runner_grpc.pb.go
-├── scripts/
-│   ├── _lib/
-│   │   ├── runner.py              # Python helper wrapping gRPC client
-│   │   ├── gen/                   # Generated protobuf Python code
-│   │   │   ├── runner_pb2.py
-│   │   │   └── runner_pb2_grpc.py
-│   │   └── tests/                 # Python helper unit tests (Go integration tests live in tests/integration/)
-│   │       └── test_runner.py     # Unit tests for helper lib
-│   ├── hello_world/               # Simple greeting (output, progress)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── data_processor/            # String processing (real work + progress)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── numpy_stats/               # Numpy stats (pre-installed pkg + data_result)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── cache_produce/             # Shared cache producer (cache_set + numpy + hold)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── cache_consume/             # Shared cache consumer (cache_get + numpy)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── file_export/               # File export via native save dialog
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── db_todo/                   # SQLite todo list (db_execute + db_query)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── db_keyvalue/               # SQLite key-value store (db_execute + db_query)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── db_run_history/            # Query run history from SQLite (db_query)
-│   │   ├── script.json
-│   │   └── main.py
-│   ├── parallel_worker/           # Concurrent worker demo (parallel runs)
-│   │   ├── script.json
-│   │   └── main.py
-│   └── error_stages/              # Partial failure (error propagation path)
-│       ├── script.json
-│       └── main.py
-├── frontend/
-│   ├── package.json
-│   ├── vite.config.ts
-│   ├── bindings/                  # Auto-generated by wails3
-│   └── src/
-│       ├── main.tsx
-│       ├── App.tsx
-│       ├── components/
-│       │   ├── TaskCard.tsx
-│       │   ├── TaskCard.test.tsx
-│       │   ├── TaskGrid.tsx
-│       │   ├── RunOutput.tsx
-│       │   ├── ParamForm.tsx
-│       │   ├── ParamForm.test.tsx
-│       │   ├── LogViewer.tsx        # Unified log panel with filters
-│       │   └── LogViewer.test.tsx
-│       └── hooks/
-│           └── useScripts.ts      # Wails bindings + events, RunStatus type
-├── python/
-│   ├── README.md                  # How to set up portable Python
-│   └── requirements.txt           # Shared base deps (grpcio, protobuf)
-├── tests/
-│   └── integration/               # End-to-end Go->Python->Go tests
-│       ├── full_run_test.go
-│       ├── parallel_test.go
-│       ├── plugin_test.go
-│       ├── error_propagation_test.go
-│       ├── cache_test.go
-│       └── testdata/              # Fixture scripts for tests
-│           ├── echo_script/
-│           ├── crash_script/
-│           ├── slow_script/
-│           ├── partial_fail/
-│           ├── cache_producer/
-│           ├── cache_consumer/
-│           └── cache_crash/
-├── build/
-│   └── bundle_python.py           # Download + package portable Python
-├── Makefile                       # Build + test orchestration
-└── CLAUDE.md
 ```
 
 ## Protobuf Contract
@@ -313,6 +185,7 @@ Parts 2 and 3 used to be two separate things to remember (slog + Wails Emit). Th
 3. **Reservoir is constructor-only.** Every service takes `notify.Reservoir` as a constructor parameter. No `SetReservoir`, no two-phase init, no nil-tolerant fallback.
 4. **Banner publication uses `Reservoir.ReplaceBannersByPrefix` directly.** No per-service `publishIssues` wrapper. Whoever owns the keyspace (`loadIssue:*`, etc.) calls `ReplaceBannersByPrefix` itself.
 5. **`*slog.Logger` exists only in `main.go` and `internal/notify`.** Importing `log/slog` in a service breaks the rule.
+6. **One Report per failure.** A failure that crosses the Go→frontend boundary is `Report`'d by the Go side only. The frontend catch is silent (or `console.warn` for debugging) — never `addNotification`. Pure-frontend failures (input validation, transport-layer where Wails itself broke) still go through `LogService.LogError` or `addNotification`, which routes through the reservoir. The mechanical test: *"does this catch follow an `await bindings.X.Y(...)`?"* If yes, do not addNotification — Go already did.
 
 ### Three orthogonal axes (not a hierarchy)
 
@@ -344,6 +217,8 @@ Surface is **determined by** Severity × Persistence inside `notify.Reservoir.ro
 | Holding `*slog.Logger` in a service | Violates the orthodoxy. Logger is internal to `notify.Reservoir`. |
 | `s.logger.Error(...)` then `app.Event.Emit("foo:error", ...)` | Two-call pattern; one of them will rot. Use a single `Report`. |
 | `addNotification({severity:'error', ...})` from a frontend path that has no Go-side log | Toast vanishes in 6s; tomorrow's bug report has no trace. Frontend errors should go through `LogService.LogError` (which routes through the reservoir). |
+| `addNotification(...)` in the catch block of an `await bindings.X.Y(...)` call | The Go side's `reservoir.Report` already produced the toast via `notify:toast`. Adding another via `addNotification` creates a near-identical duplicate with a different React id. Frontend catch is control flow only. |
+| Calling `reservoir.Report` on user cancellation (closed dialog, declined prompt) | Cancel is not a failure. Use `runner.ErrDialogCancelled` (or an operation-specific sentinel) and short-circuit the Report path. See § Cancellation vs failure. |
 | `try { ... } catch { return null }` | Silent swallow; downstream can't tell "no data" from "broken." |
 | Returning success with a `Severity:Warn` `Report` of "partial failure" | If part failed, the operation failed. Period. |
 | Default-to-fallback values on error | Hides failures. The caller can decide on a fallback if they want one. |
@@ -381,10 +256,18 @@ Frontend caller:
 ```ts
 try {
   await bindings.FooService.DoThing(arg)
-} catch (e) {
-  const msg = e instanceof Error ? e.message : String(e)
-  addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to do thing: ${msg}` })
-  // Go already reservoir.Report'd — no need for LogService.LogError here.
+} catch {
+  // Go's reservoir.Report already surfaced this via notify:toast.
+  // Frontend catch is control flow only — no addNotification, no LogError.
+}
+```
+
+Pure-frontend validation (no binding involved) still surfaces via `addNotification`, since Go never sees these and would not otherwise log them:
+
+```ts
+if (!spec.trim()) {
+  addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Package spec cannot be empty' })
+  return
 }
 ```
 
@@ -435,6 +318,34 @@ if primaryErr != nil {
 ```
 
 Every error is durably reported at its layer; the joined error becomes the binding's rejection on the frontend. No exemption, no carve-out.
+
+### Cancellation vs failure
+
+User-driven non-completion (closed dialog, declined prompt, cooperative cancel) is **not** a failure. It must not call `reservoir.Report`. Use a sentinel error at the boundary and short-circuit the Report path:
+
+```go
+// internal/runner/dialog.go
+var ErrDialogCancelled = errors.New("dialog cancelled by user")
+
+// main.go wailsDialogHandler — translate empty-path to the sentinel
+path, err := d.PromptForSingleSelection()
+if path == "" {
+    return "", runner.ErrDialogCancelled
+}
+return path, err
+
+// internal/runner/grpc_server.go handleFileDialog
+switch {
+case errors.Is(err, ErrDialogCancelled):
+    resp.Cancelled = true                  // silent — not a failure
+case err != nil:
+    s.reservoir.Report(notify.Event{...})  // real OS failure
+    resp.Cancelled = true
+    resp.Error = err.Error()
+}
+```
+
+Sentinel + `errors.Is` keeps future call sites uniform. The boundary (the dialog handler in `main.go`) is responsible for normalizing platform-specific cancel signals (empty-path, specific error types, etc.) into `ErrDialogCancelled`; downstream layers only check the sentinel.
 
 ### Tests must enforce
 
@@ -557,7 +468,7 @@ Users can override built-in scripts or add new ones after the binary is built an
 
 - **Linux**: `~/.go-python-runner/scripts/`
 - **Windows**: `%APPDATA%/go-python-runner/scripts/`
-- Configurable via config file or environment variable `PYRUNNER_PLUGIN_DIR`
+- Override via environment variable `PYRUNNER_PLUGIN_DIR` (resolved by `registry.DefaultPluginDir`)
 - Same structure as built-in: `<plugin-dir>/<script-name>/script.json + main.py`
 
 ### Registry behavior (`internal/registry/registry.go`)
@@ -647,7 +558,6 @@ A run's true state is the combination of multiple independent variables across l
 ```text
 REGISTERED
 │  Go: GRPCServer.RegisterRun() creates RunChannel (stream=nil, connected=open)
-│  grpc_server.go:RegisterRun (called from manager.go:StartRun)
 │
 ├─ proc.Start() succeeds
 ▼
@@ -655,13 +565,11 @@ PROCESS_STARTED
 │  Go: Status="running", added to activeRuns map
 │  RunChannel: stream=nil, waiting for Python to connect
 │  React: status="running" (set immediately on startRun)
-│  manager.go:72-83
 │
-├─ Python connects via gRPC ──────────────── or ── 30s timeout → FAILED
-▼                                                   manager.go:96-99
+├─ Python connects via gRPC ──────────────── or ── connect timeout → FAILED
+▼
 CONNECTED
 │  RunChannel: stream=set, connected=closed (via sync.Once)
-│  grpc_server.go:229-230
 │
 ├─ SendStart() delivers params
 ▼
@@ -673,21 +581,21 @@ EXECUTING
 ▼                     ▼                           ▼
 COMPLETED          ERRORED                     CANCELLED
 Status="completed"  Status="failed"             gRPC cancel + proc.Kill
-manager.go:116      GotError flag tracks         Status="failed"
-                    whether structured error     manager.go:177-182
+                    GotError flag tracks         Status="failed"
+                    whether structured error
                     arrived via gRPC vs stderr
-                    manager.go:117-134
 │                     │                           │
 └─────────────────────┴───────────────────────────┘
                       │
                       ▼
                CLEANING UP
-               1. cache.CleanupRun(runID)     — release cache refs
-               2. grpc.UnregisterRun(runID)   — close Messages chan, remove RunChannel
-               3. delete from activeRuns       — remove from live tracking
-               4. append to history[]          — persist as RunRecord
-               manager.go:138-153
+               1. cache.CleanupRun(runID)    — release cache refs
+               2. grpc.UnregisterRun(runID)  — close Messages chan, remove RunChannel
+               3. delete from activeRuns      — remove from live tracking
+               4. append to history[]         — persist as RunRecord
 ```
+
+Authoritative implementation: `Manager.StartRun` / `Manager.waitForExit` in `internal/runner/manager.go`, `GRPCServer.RegisterRun` in `internal/runner/grpc_server.go`.
 
 ### Safeguards
 
@@ -766,36 +674,37 @@ Full end-to-end: Go spawns Python subprocess, gRPC connects, typed messages flow
 
 Located in `tests/integration/`, gated with `//go:build integration` build tag.
 
-| Test | What it validates |
-| --- | --- |
-| `TestFullRun` | Go manager starts a real Python script, collects all messages from typed channel, asserts output -> progress -> status sequence |
-| `TestParallelRuns` | Start 3 scripts concurrently, verify each gets independent message streams with no cross-talk |
-| `TestPluginOverride` | Load builtin + plugin with same ID, run it, verify the plugin version executed |
-| `TestScriptCrash` | Run a script that raises an exception — verify stderr captured, error logged, status = "failed" |
-| `TestCancelMidRun` | Start a long-running script, cancel it mid-execution, verify process terminated and status = "failed" |
-| `TestCacheShareObject` | Script A caches a dict via `cache_set`, Script B retrieves it via `cache_get` — verify object equality |
-| `TestCacheConcurrentReaders` | 3 scripts reading the same cached object simultaneously — verify no corruption |
-| `TestCacheCleanupOnCrash` | Kill script that owns a cache block — verify Go releases shared memory |
-| `TestErrorPropagation` | Run a script that fails with traceback — verify structured error message + traceback reach the message channel |
+Coverage spans the contracts that span both the Go and Python sides:
 
-Test fixture scripts live in `tests/integration/testdata/` (echo, crash, slow, partial_fail, cache_producer/consumer/crash variants).
+- **Happy-path message flow** — manager spawns Python, typed messages flow output → progress → status, run reaches `completed`.
+- **Parallel isolation** — concurrent runs get independent streams; no cross-talk in messages, cache refs, or status.
+- **Plugin override** — same-ID plugin replaces the builtin at execution time, not just in the registry list.
+- **Crash & cancel** — Python exception, Go-side cancel, and SIGTERM-ignoring child each end at `failed` with the right traceback / stderr captured.
+- **Trust order** — the Manager treats Python's `complete()`/`fail()` and the OS exit code as independent inputs and resolves disagreement deterministically (`tests/integration/trust_order_test.go`).
+- **Shared cache** — `cache_set` / `cache_get` round-trip arbitrary picklables; producer crash releases blocks; pickling errors surface as structured failures.
+- **Stress-extra** — progress bursts, huge single messages, concurrent DB writes, and run-history scaling.
+
+Fixture scripts live in `tests/integration/testdata/` and are added per scenario rather than enumerated in the doc.
 
 ### Test Commands
 
 ```bash
 # Go unit + service tests
-go test ./internal/...
+make test-go                                     # go test -race ./internal/...
 
-# Go integration tests (requires Python)
-go test ./tests/integration/ -tags=integration
+# Go end-to-end (requires Python)
+make test-integration                            # -tags=integration
+
+# Stress tests (high-volume / concurrency, longer timeout)
+make test-stress                                 # -tags=stress
 
 # Python tests
-cd scripts/_lib && pytest tests/
+make test-python                                 # uv run pytest scripts/_lib/tests/
 
 # Frontend tests
-cd frontend && npx vitest run
+make test-frontend                               # cd frontend && npx vitest run
 
-# All tests
+# Default suite (go + python + frontend + integration; stress is opt-in)
 make test
 ```
 
@@ -846,10 +755,11 @@ make bindings                                    # Wails TypeScript bindings
 make test
 
 # Run tests by layer
-go test ./internal/...                           # Go unit + service
-go test ./tests/integration/ -tags=integration   # Go integration
-uv run pytest scripts/_lib/tests/                # Python
-cd frontend && npx vitest run                    # Frontend
+go test -race ./internal/...                                     # Go unit + service
+go test -race ./tests/integration/ -tags=integration             # Go integration
+go test -race ./tests/stress/... -tags=stress -timeout=300s      # Go stress (opt-in)
+uv run pytest scripts/_lib/tests/                                # Python
+cd frontend && npx vitest run                                    # Frontend
 
 # Lint all layers
 make lint                                        # All linters

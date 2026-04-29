@@ -1,5 +1,32 @@
 import type { RunState } from '../hooks/useScripts'
 
+interface ProgressBarProps {
+  current: number
+  total: number
+  label?: string
+}
+
+// ProgressBar is the shared bar markup used by RunOutput (per-run) and
+// AggregateRunPanel (group rollup). One source of truth for the Tailwind
+// classes — keep the visuals identical across both surfaces.
+export function ProgressBar({ current, total, label }: ProgressBarProps) {
+  const pct = total > 0 ? Math.max(0, Math.min(100, (current / total) * 100)) : 0
+  return (
+    <div>
+      <div className="flex justify-between text-sm text-slate-400 mb-1">
+        <span>{label ?? ''}</span>
+        <span>{current}/{total}</span>
+      </div>
+      <div className="w-full bg-slate-700 rounded-full h-2">
+        <div
+          className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
 interface RunOutputProps {
   run: RunState
 }
@@ -7,20 +34,12 @@ interface RunOutputProps {
 function RunOutput({ run }: RunOutputProps) {
   return (
     <div className="space-y-3">
-      {/* Progress bar */}
       {run.progress && (
-        <div>
-          <div className="flex justify-between text-sm text-slate-400 mb-1">
-            <span>{run.progress.label}</span>
-            <span>{run.progress.current}/{run.progress.total}</span>
-          </div>
-          <div className="w-full bg-slate-700 rounded-full h-2">
-            <div
-              className="bg-blue-500 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${run.progress.total > 0 ? Math.max(0, Math.min(100, (run.progress.current / run.progress.total) * 100)) : 0}%` }}
-            />
-          </div>
-        </div>
+        <ProgressBar
+          current={run.progress.current}
+          total={run.progress.total}
+          label={run.progress.label}
+        />
       )}
 
       {/* Status badge */}

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -491,5 +492,122 @@ func TestGRPCServer_DbQueryError(t *testing.T) {
 	}
 	if qr.Error == "" {
 		t.Error("expected error for invalid table, got empty string")
+	}
+}
+
+// fakeDialogHandler is a test double for runner.DialogHandler. It returns the
+// pre-set path/err pair from any OpenFile/SaveFile call.
+type fakeDialogHandler struct {
+	path string
+	err  error
+}
+
+func (f *fakeDialogHandler) OpenFile(_, _ string, _ []FileFilterDef) (string, error) {
+	return f.path, f.err
+}
+func (f *fakeDialogHandler) SaveFile(_, _, _ string, _ []FileFilterDef) (string, error) {
+	return f.path, f.err
+}
+
+// testGRPCServerWithReservoir is testGRPCServer's variant that exposes the
+// recording reservoir, so dialog tests can assert on Report calls.
+func testGRPCServerWithReservoir(t *testing.T) (*GRPCServer, *notify.RecordingReservoir, func()) {
+	t.Helper()
+	cache := NewCacheManager()
+	store, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	rec := &notify.RecordingReservoir{}
+	srv, err := NewGRPCServer(cache, store, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, rec, func() { srv.Stop() }
+}
+
+// User cancellation must NOT call reservoir.Report. Cancel is a clean
+// "no result" outcome — silent at the surfacing layer.
+func TestGRPCServer_FileDialog_CancelDoesNotReport(t *testing.T) {
+	srv, rec, cleanup := testGRPCServerWithReservoir(t)
+	defer cleanup()
+
+	srv.SetDialogHandler(&fakeDialogHandler{err: ErrDialogCancelled})
+
+	srv.RegisterRun("run-cancel")
+	stream, connCleanup := connectClient(t, srv.Addr(), "run-cancel")
+	defer connCleanup()
+	<-srv.WaitConnected("run-cancel")
+
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_FileDialog{
+			FileDialog: &pb.FileDialogRequest{Type: "save", Title: "Cancelled"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := resp.GetFileDialogResponse()
+	if r == nil {
+		t.Fatal("expected FileDialogResponse")
+	}
+	if !r.Cancelled {
+		t.Error("expected Cancelled=true on user cancel")
+	}
+	if r.Error != "" {
+		t.Errorf("expected empty Error on cancel, got %q", r.Error)
+	}
+
+	for _, ev := range rec.Events() {
+		if ev.Severity == notify.SeverityError {
+			t.Errorf("user cancel must not produce an error Event: %+v", ev)
+		}
+	}
+}
+
+// A real dialog handler error (NOT the cancel sentinel) MUST flow through
+// reservoir.Report — the error contract still holds for genuine failures.
+func TestGRPCServer_FileDialog_ErrorReports(t *testing.T) {
+	srv, rec, cleanup := testGRPCServerWithReservoir(t)
+	defer cleanup()
+
+	osErr := errors.New("OS dialog API failed")
+	srv.SetDialogHandler(&fakeDialogHandler{err: osErr})
+
+	srv.RegisterRun("run-dialog-err")
+	stream, connCleanup := connectClient(t, srv.Addr(), "run-dialog-err")
+	defer connCleanup()
+	<-srv.WaitConnected("run-dialog-err")
+
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_FileDialog{
+			FileDialog: &pb.FileDialogRequest{Type: "open", Title: "Real failure"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := resp.GetFileDialogResponse()
+	if r == nil {
+		t.Fatal("expected FileDialogResponse")
+	}
+	if r.Error == "" {
+		t.Error("expected non-empty Error on genuine OS failure")
+	}
+
+	errs := rec.FindBySeverity(notify.SeverityError)
+	if len(errs) == 0 {
+		t.Fatal("expected at least one SeverityError event for genuine OS failure")
 	}
 }

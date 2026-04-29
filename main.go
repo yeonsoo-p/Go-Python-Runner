@@ -242,7 +242,13 @@ func (h *wailsDialogHandler) OpenFile(title, directory string, filters []runner.
 	for _, f := range filters {
 		d.AddFilter(f.DisplayName, f.Pattern)
 	}
-	return d.PromptForSingleSelection()
+	path, err := d.PromptForSingleSelection()
+	if path == "" {
+		// Empty path = user cancelled, regardless of err. Different platforms
+		// surface cancel as nil-err vs. a specific err; treat both as cancel.
+		return "", runner.ErrDialogCancelled
+	}
+	return path, err
 }
 
 func (h *wailsDialogHandler) SaveFile(title, directory, filename string, filters []runner.FileFilterDef) (string, error) {
@@ -259,7 +265,11 @@ func (h *wailsDialogHandler) SaveFile(title, directory, filename string, filters
 	for _, f := range filters {
 		d.AddFilter(f.DisplayName, f.Pattern)
 	}
-	return d.PromptForSingleSelection()
+	path, err := d.PromptForSingleSelection()
+	if path == "" {
+		return "", runner.ErrDialogCancelled
+	}
+	return path, err
 }
 
 // findScriptsDir locates the scripts directory relative to the executable or CWD.

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -62,18 +63,6 @@ type RunChannel struct {
 	gotCompletedStatus atomic.Bool            // true if a StatusMsg with state "completed" was received
 	gotFailedStatus    atomic.Bool            // true if a StatusMsg with state "failed" was received
 	errorMessage       atomic.Pointer[string] // last ErrorMsg text, nil if none
-}
-
-// DialogHandler opens native file dialogs. Implemented by the Wails app layer.
-type DialogHandler interface {
-	OpenFile(title string, directory string, filters []FileFilterDef) (string, error)
-	SaveFile(title string, directory string, filename string, filters []FileFilterDef) (string, error)
-}
-
-// FileFilterDef describes a file type filter for dialogs.
-type FileFilterDef struct {
-	DisplayName string
-	Pattern     string
 }
 
 // GRPCServer implements the PythonRunner gRPC service.
@@ -466,7 +455,11 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 	}
 
 	resp := &pb.FileDialogResponse{}
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrDialogCancelled):
+		// User-driven non-completion is silent — not a failure.
+		resp.Cancelled = true
+	case err != nil:
 		s.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityError,
 			Persistence: notify.PersistenceOneShot,
@@ -478,9 +471,9 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 		})
 		resp.Cancelled = true
 		resp.Error = err.Error()
-	} else if path == "" {
+	case path == "":
 		resp.Cancelled = true
-	} else {
+	default:
 		resp.Paths = []string{path}
 	}
 

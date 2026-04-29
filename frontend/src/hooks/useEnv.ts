@@ -60,12 +60,12 @@ export function useEnv() {
       }
       const next = await bindings.EnvService.GetEnvInfo()
       setInfo(next ?? null)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to load environment info: ${msg}` })
+    } catch {
+      // Go's reservoir.Report already surfaced this via notify:toast.
+      // Frontend catch is control flow only.
       setAvailable(false)
     }
-  }, [addNotification])
+  }, [])
 
   const loadPackages = useCallback(async () => {
     try {
@@ -73,11 +73,10 @@ export function useEnv() {
       if (!bindings.EnvService?.ListPackages) return
       const list = await bindings.EnvService.ListPackages()
       setPackages(list ?? [])
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to list packages: ${msg}` })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
-  }, [addNotification])
+  }, [])
 
   // Initial fetch.
   useEffect(() => {
@@ -132,15 +131,15 @@ export function useEnv() {
 
   const installPackage = useCallback(async (spec: string) => {
     if (!spec.trim()) {
+      // Pure-frontend validation: Go never sees this, so we surface it here.
       addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Package spec cannot be empty' })
       return
     }
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
       await bindings.EnvService.InstallPackage(spec, indexURL)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Install ${spec} failed: ${msg}` })
+    } catch {
+      // Go's reservoir.Report already surfaced via notify:toast.
     }
   }, [addNotification, indexURL])
 
@@ -152,9 +151,8 @@ export function useEnv() {
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
       await bindings.EnvService.InstallRequirements(absPath, indexURL)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Install from ${absPath} failed: ${msg}` })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
   }, [addNotification, indexURL])
 
@@ -162,11 +160,10 @@ export function useEnv() {
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
       await bindings.EnvService.UninstallPackage(name)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Uninstall ${name} failed: ${msg}` })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
-  }, [addNotification])
+  }, [])
 
   return {
     info,

@@ -24,15 +24,28 @@ export interface RunState {
   data: Record<string, string> | null
 }
 
-interface OutputEvent { runID: string; scriptID: string; text: string }
-interface ProgressEvent { runID: string; scriptID: string; current: number; total: number; label: string }
-interface StatusEvent { runID: string; scriptID: string; state: RunStatus }
-interface ErrorEvent { runID: string; scriptID: string; message: string; traceback: string }
-interface DataEvent { runID: string; scriptID: string; key: string; value: string }
+// RunGroupState describes a parallel-run batch returned by StartParallelRuns.
+// Manager owns membership; the frontend uses GroupID to render an aggregate
+// progress bar over the children. RunIDs are immutable after creation.
+export interface RunGroupState {
+  groupID: string
+  scriptID: string
+  runIDs: string[]
+  startedAt: number
+}
+
+// All run events carry an optional groupID. Empty string means the run is
+// not part of a parallel group.
+interface OutputEvent { runID: string; scriptID: string; groupID?: string; text: string }
+interface ProgressEvent { runID: string; scriptID: string; groupID?: string; current: number; total: number; label: string }
+interface StatusEvent { runID: string; scriptID: string; groupID?: string; state: RunStatus }
+interface ErrorEvent { runID: string; scriptID: string; groupID?: string; message: string; traceback: string }
+interface DataEvent { runID: string; scriptID: string; groupID?: string; key: string; value: string }
 
 export function useScripts() {
   const [scripts, setScripts] = useState<Script[]>([])
   const [runs, setRuns] = useState<Map<string, RunState>>(new Map())
+  const [groups, setGroups] = useState<Map<string, RunGroupState>>(new Map())
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const { addNotification } = useNotifications()
@@ -169,19 +182,9 @@ export function useScripts() {
     }
   }, [addNotification])
 
-  // Transient action failures (StartRun / StartParallelRuns / CancelRun threw)
-  // are reported as toasts. The runs Map only ever contains real Manager-issued
-  // runIDs — the frontend no longer fabricates pseudo-IDs for failure-only display.
-  const reportTransient = useCallback((message: string, ctx: { scriptID?: string; runID?: string }) => {
-    addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message, scriptID: ctx.scriptID, runID: ctx.runID })
-    import('../../bindings/go-python-runner/internal/services')
-      .then(svc => svc.LogService?.LogError?.('frontend', message, {
-        ...(ctx.scriptID ? { scriptID: ctx.scriptID } : {}),
-        ...(ctx.runID ? { runID: ctx.runID } : {}),
-      }))
-      .catch(() => { /* bindings not available */ })
-  }, [addNotification])
-
+  // Wails-bound action failures (StartRun / StartParallelRuns / CancelRun)
+  // are surfaced by the Go side via reservoir.Report → notify:toast. The
+  // frontend catch is control flow only — no addNotification, no LogError.
   const startRun = useCallback(async (scriptID: string, params: Record<string, string>) => {
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
@@ -200,18 +203,24 @@ export function useScripts() {
         })
         return runID
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      reportTransient(`Failed to start run: ${msg}`, { scriptID })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
     return null
-  }, [reportTransient])
+  }, [])
 
   const startParallelRuns = useCallback(async (scriptID: string, params: Record<string, string>, workerCount: number) => {
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
       if (bindings.RunnerService?.StartParallelRuns) {
-        const runIDs: string[] = await bindings.RunnerService.StartParallelRuns(scriptID, params, workerCount)
+        const result = await bindings.RunnerService.StartParallelRuns(scriptID, params, workerCount)
+        const { groupID, runIDs } = result
+        const startedAt = Date.now()
+        setGroups(prev => {
+          const next = new Map(prev)
+          next.set(groupID, { groupID, scriptID, runIDs: [...runIDs], startedAt })
+          return next
+        })
         setRuns(prev => {
           const next = new Map(prev)
           for (const runID of runIDs) {
@@ -225,12 +234,11 @@ export function useScripts() {
         })
         return runIDs
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      reportTransient(`Failed to start parallel runs: ${msg}`, { scriptID })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
     return null
-  }, [reportTransient])
+  }, [])
 
   const cancelRun = useCallback(async (runID: string) => {
     try {
@@ -238,11 +246,43 @@ export function useScripts() {
       if (bindings.RunnerService?.CancelRun) {
         await bindings.RunnerService.CancelRun(runID)
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      reportTransient(`Failed to cancel run: ${msg}`, { runID })
+    } catch {
+      // Go already surfaced via notify:toast.
     }
-  }, [reportTransient])
+  }, [])
 
-  return { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun }
+  const cancelGroup = useCallback(async (groupID: string) => {
+    try {
+      const bindings = await import('../../bindings/go-python-runner/internal/services')
+      if (bindings.RunnerService?.CancelGroup) {
+        await bindings.RunnerService.CancelGroup(groupID)
+      }
+    } catch {
+      // Go already surfaced via notify:toast.
+    }
+  }, [])
+
+  // GC: drop a group once every member run has reached a terminal state.
+  // The group remains visible while at least one worker is still running so
+  // the aggregate panel keeps rendering across worker completions.
+  useEffect(() => {
+    if (groups.size === 0) return
+    setGroups(prev => {
+      let changed = false
+      const next = new Map(prev)
+      for (const [groupID, g] of prev) {
+        const allTerminal = g.runIDs.every(id => {
+          const r = runs.get(id)
+          return r && r.status !== 'running'
+        })
+        if (allTerminal) {
+          next.delete(groupID)
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+  }, [runs, groups])
+
+  return { scripts, runs, groups, loading, loadError, startRun, startParallelRuns, cancelRun, cancelGroup }
 }

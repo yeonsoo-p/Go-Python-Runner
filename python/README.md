@@ -17,7 +17,7 @@ From the project root (requires `uv`):
 uv run python build/bundle_python.py
 ```
 
-This uses `uv python install` to download a portable Python, installs deps from `requirements.txt`, and removes unnecessary directories (tcl, test, idlelib, pip, etc.).
+This uses `uv python install` to download a portable Python, installs deps from `requirements.txt`, and strips runtime-unnecessary directories (the cleanup list lives in `build/bundle_python.py`).
 
 ## Directory structure (after bundling)
 

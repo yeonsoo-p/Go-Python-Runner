@@ -1,19 +1,30 @@
 import { useState } from 'react'
-import type { Script, RunState } from '../hooks/useScripts'
+import type { Script, RunState, RunGroupState } from '../hooks/useScripts'
 import ParamForm from './ParamForm'
 import RunOutput from './RunOutput'
+import AggregateRunPanel from './AggregateRunPanel'
 
 interface TaskCardProps {
   script: Script
   runs: RunState[]
+  // Groups for this script. The TaskCard renders an AggregateRunPanel for any
+  // group whose runIDs are present in `runs`; ungrouped runs render as
+  // standalone per-run cards.
+  groups?: RunGroupState[]
   onStartRun: (scriptID: string, params: Record<string, string>, workerCount?: number) => void
   onCancelRun: (runID: string) => void
+  onCancelGroup?: (groupID: string) => void
 }
 
-function TaskCard({ script, runs, onStartRun, onCancelRun }: TaskCardProps) {
+function TaskCard({ script, runs, groups = [], onStartRun, onCancelRun, onCancelGroup }: TaskCardProps) {
   const [expanded, setExpanded] = useState(false)
+  const runsByID = new Map(runs.map(r => [r.runID, r]))
+  const groupedRunIDs = new Set<string>()
+  for (const g of groups) for (const id of g.runIDs) groupedRunIDs.add(id)
+
+  const ungroupedRuns = runs.filter(r => !groupedRunIDs.has(r.runID))
   const activeRuns = runs.filter((r) => r.status === 'running')
-  const latestFinished = [...runs].reverse().find((r) => r.status !== 'running')
+  const latestFinishedUngrouped = [...ungroupedRuns].reverse().find((r) => r.status !== 'running')
   const latestRun = runs[runs.length - 1]
 
   const statusColor = latestRun
@@ -21,6 +32,12 @@ function TaskCard({ script, runs, onStartRun, onCancelRun }: TaskCardProps) {
     : latestRun.status === 'failed' ? 'bg-red-500'
     : 'bg-yellow-500'
     : 'bg-slate-600'
+
+  // Header chip: if a group is live, surface "{N} workers"; otherwise the
+  // pre-existing "{N} running" count for ungrouped parallel runs.
+  const headerChip = groups.length > 0
+    ? `${groups[0].runIDs.length} workers`
+    : (activeRuns.length > 1 ? `${activeRuns.length} running` : null)
 
   return (
     <div className="bg-slate-800 rounded-lg border border-slate-700 overflow-hidden">
@@ -36,9 +53,9 @@ function TaskCard({ script, runs, onStartRun, onCancelRun }: TaskCardProps) {
                 plugin
               </span>
             )}
-            {activeRuns.length > 1 && (
+            {headerChip && (
               <span className="text-xs px-2 py-0.5 rounded bg-blue-600 text-blue-100">
-                {activeRuns.length} running
+                {headerChip}
               </span>
             )}
           </div>
@@ -62,7 +79,23 @@ function TaskCard({ script, runs, onStartRun, onCancelRun }: TaskCardProps) {
             onSubmit={(params, workerCount) => onStartRun(script.id, params, workerCount)}
           />
 
-          {activeRuns.map((run) => (
+          {groups.map((g) => {
+            const groupRuns = g.runIDs
+              .map(id => runsByID.get(id))
+              .filter((r): r is RunState => r !== undefined)
+            if (groupRuns.length === 0) return null
+            return (
+              <AggregateRunPanel
+                key={g.groupID}
+                group={g}
+                runs={groupRuns}
+                onCancelGroup={onCancelGroup ?? (() => {})}
+                onCancelRun={onCancelRun}
+              />
+            )
+          })}
+
+          {ungroupedRuns.filter(r => r.status === 'running').map((run) => (
             <div key={run.runID} className="border border-slate-600 rounded-lg p-3 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-400 font-mono">{run.runID.slice(0, 8)}</span>
@@ -77,7 +110,7 @@ function TaskCard({ script, runs, onStartRun, onCancelRun }: TaskCardProps) {
             </div>
           ))}
 
-          {latestFinished && <RunOutput run={latestFinished} />}
+          {latestFinishedUngrouped && <RunOutput run={latestFinishedUngrouped} />}
         </div>
       )}
     </div>

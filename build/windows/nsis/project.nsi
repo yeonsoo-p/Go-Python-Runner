@@ -52,7 +52,8 @@ ManifestDPIAware true
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
-# !insertmacro MUI_PAGE_LICENSE "resources\eula.txt" # Adds a EULA page to the installer
+!insertmacro MUI_PAGE_LICENSE "..\..\..\LICENSE" # MIT license shipped at repo root.
+!insertmacro MUI_PAGE_COMPONENTS # Optional shortcut selection.
 !insertmacro MUI_PAGE_DIRECTORY # In which folder install page.
 !insertmacro MUI_PAGE_INSTFILES # Installing page.
 !insertmacro MUI_PAGE_FINISH # Finished installation page.
@@ -85,7 +86,7 @@ Function .onInit
    ${EndIf}
 FunctionEnd
 
-Section
+Section "-Core" SecCore
     !insertmacro wails.setShellContext
 
     !insertmacro wails.webview2runtime
@@ -104,13 +105,18 @@ Section
 
     SetOutPath $INSTDIR
 
-    CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
-    CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
-
     !insertmacro wails.associateFiles
     !insertmacro wails.associateCustomProtocols
-    
+
     !insertmacro wails.writeUninstaller
+SectionEnd
+
+Section "Start Menu shortcut" SecStartMenu
+    CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+SectionEnd
+
+Section "Desktop shortcut" SecDesktop
+    CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
 SectionEnd
 
 Section "uninstall" 
@@ -120,6 +126,7 @@ Section "uninstall"
 
     RMDir /r $INSTDIR
 
+    ; Shortcuts are opt-in at install time; Delete is a no-op if absent.
     Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"
 
