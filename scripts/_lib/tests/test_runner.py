@@ -10,6 +10,8 @@ import os
 import sys
 from typing import Any
 
+import pytest
+
 # Add _lib to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -126,26 +128,23 @@ def test_cache_release_sends_message() -> None:
 
 def test_cache_get_raises_without_connection() -> None:
     """cache_get must raise RuntimeError if connect() was never called."""
-    import pytest
 
     with pytest.raises(RuntimeError, match="not connected"):
         runner.cache_get("any_key")
 
 
-def test_open_file_dialog_raises_without_connection() -> None:
-    """open_file_dialog must raise RuntimeError if connect() was never called."""
-    import pytest
+def test_dialog_open_raises_without_connection() -> None:
+    """dialog_open must raise RuntimeError if connect() was never called."""
 
     with pytest.raises(RuntimeError, match="not connected"):
-        runner.open_file_dialog()
+        runner.dialog_open()
 
 
-def test_save_file_dialog_raises_without_connection() -> None:
-    """save_file_dialog must raise RuntimeError if connect() was never called."""
-    import pytest
+def test_dialog_save_raises_without_connection() -> None:
+    """dialog_save must raise RuntimeError if connect() was never called."""
 
     with pytest.raises(RuntimeError, match="not connected"):
-        runner.save_file_dialog()
+        runner.dialog_save()
 
 
 def test_progress_converts_types() -> None:
@@ -170,7 +169,6 @@ def test_is_cancelled_after_event_set() -> None:
 
 def test_send_raises_on_cancel() -> None:
     """_send() raises CancelledError when the cancel event is set."""
-    import pytest
 
     runner._cancel_event.set()
     with pytest.raises(runner.CancelledError):

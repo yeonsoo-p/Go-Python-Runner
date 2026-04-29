@@ -47,9 +47,14 @@ type RunChannel struct {
 	streamDone    chan struct{} // closed when Execute() returns (all messages forwarded)
 	closed        bool         // true after UnregisterRun closes Messages
 	closedMu      sync.Mutex   // protects closed flag and channel sends
-	gotError        atomic.Bool  // true if an ErrorMsg was received via gRPC
-	gotFailedStatus atomic.Bool  // true if a StatusMsg with state "failed" was received
-	errorMessage    atomic.Value // stores the last ErrorMsg text (string) for DB persistence
+	// Manager-internal flags. Set by gRPC handlers from incoming Python messages,
+	// read by Manager.waitForExit when deriving finalStatus. Manager is the sole
+	// authority on the user-visible run status; these flags never reach the
+	// frontend on their own.
+	gotError           atomic.Bool            // true if an ErrorMsg was received via gRPC
+	gotCompletedStatus atomic.Bool            // true if a StatusMsg with state "completed" was received
+	gotFailedStatus    atomic.Bool            // true if a StatusMsg with state "failed" was received
+	errorMessage       atomic.Pointer[string] // last ErrorMsg text, nil if none
 }
 
 // DialogHandler opens native file dialogs. Implemented by the Wails app layer.
@@ -291,13 +296,20 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Label:   m.Progress.Label,
 		})
 	case *pb.ClientMessage_Status:
-		if m.Status.State == string(StatusFailed) {
+		// Python's StatusMsg is INPUT to Manager's status derivation, not a
+		// user-visible event. Manager.waitForExit reads these flags and emits
+		// the single authoritative run:status event. Do not forward to the
+		// channel — that would create a duplicate path to the frontend.
+		switch m.Status.State {
+		case string(StatusCompleted):
+			ch.gotCompletedStatus.Store(true)
+		case string(StatusFailed):
 			ch.gotFailedStatus.Store(true)
 		}
-		ch.trySend(StatusMsg{State: RunStatus(m.Status.State)})
 	case *pb.ClientMessage_Error:
 		ch.gotError.Store(true)
-		ch.errorMessage.Store(m.Error.Message)
+		msg := m.Error.Message
+		ch.errorMessage.Store(&msg)
 		ch.trySend(ErrorMsg{
 			Message:   m.Error.Message,
 			Traceback: m.Error.Traceback,
@@ -530,6 +542,17 @@ func (s *GRPCServer) GotFailedStatus(runID string) bool {
 	return ch.gotFailedStatus.Load()
 }
 
+// GotCompletedStatus returns whether the run received a "completed" StatusMsg via gRPC.
+func (s *GRPCServer) GotCompletedStatus(runID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ch, ok := s.runs[runID]
+	if !ok {
+		return false
+	}
+	return ch.gotCompletedStatus.Load()
+}
+
 // ErrorMessage returns the last structured error message text received via gRPC, if any.
 func (s *GRPCServer) ErrorMessage(runID string) string {
 	s.mu.RLock()
@@ -538,8 +561,8 @@ func (s *GRPCServer) ErrorMessage(runID string) string {
 	if !ok {
 		return ""
 	}
-	if v := ch.errorMessage.Load(); v != nil {
-		return v.(string)
+	if p := ch.errorMessage.Load(); p != nil {
+		return *p
 	}
 	return ""
 }

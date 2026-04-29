@@ -17,7 +17,7 @@ function RunOutput({ run }: RunOutputProps) {
           <div className="w-full bg-slate-700 rounded-full h-2">
             <div
               className="bg-blue-500 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${(run.progress.current / run.progress.total) * 100}%` }}
+              style={{ width: `${run.progress.total > 0 ? Math.max(0, Math.min(100, (run.progress.current / run.progress.total) * 100)) : 0}%` }}
             />
           </div>
         </div>

@@ -16,14 +16,6 @@ type LogEntry struct {
 	Traceback string
 }
 
-// LogFilter specifies criteria for filtering log entries.
-type LogFilter struct {
-	Source   string // empty = all sources
-	Level   string // empty = all levels
-	RunID   string // empty = all runs
-	ScriptID string // empty = all scripts
-}
-
 // RingBuffer is a fixed-capacity circular buffer of LogEntry values.
 // It is safe for concurrent use.
 type RingBuffer struct {
@@ -76,8 +68,9 @@ func (r *RingBuffer) Len() int {
 	return r.count
 }
 
-// Entries returns all stored entries matching the filter, in chronological order.
-func (r *RingBuffer) Entries(filter LogFilter) []LogEntry {
+// Entries returns all stored entries in chronological order.
+// Filtering by source/level/runID is done client-side (LogViewer).
+func (r *RingBuffer) Entries() []LogEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -85,26 +78,7 @@ func (r *RingBuffer) Entries(filter LogFilter) []LogEntry {
 	start := (r.head - r.count + r.cap) % r.cap
 	for i := 0; i < r.count; i++ {
 		idx := (start + i) % r.cap
-		e := r.entries[idx]
-		if matchesFilter(e, filter) {
-			result = append(result, e)
-		}
+		result = append(result, r.entries[idx])
 	}
 	return result
-}
-
-func matchesFilter(e LogEntry, f LogFilter) bool {
-	if f.Source != "" && e.Source != f.Source {
-		return false
-	}
-	if f.Level != "" && e.Level != f.Level {
-		return false
-	}
-	if f.RunID != "" && e.RunID != f.RunID {
-		return false
-	}
-	if f.ScriptID != "" && e.ScriptID != f.ScriptID {
-		return false
-	}
-	return true
 }

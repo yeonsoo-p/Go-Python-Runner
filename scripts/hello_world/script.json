@@ -5,7 +5,6 @@
   "params": [
     {
       "name": "name",
-      "type": "string",
       "required": false,
       "default": "World",
       "description": "Who to greet"

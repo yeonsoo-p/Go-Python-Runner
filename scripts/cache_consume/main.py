@@ -6,13 +6,8 @@ On Windows, shared memory blocks are reclaimed when all handles close.
 
 from __future__ import annotations
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
 import numpy as np
-from runner import cache_get, complete, connect, fail, output, progress
+from runner import cache_get, complete, output, progress, run
 
 
 def main(params: dict[str, str]) -> None:
@@ -29,9 +24,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

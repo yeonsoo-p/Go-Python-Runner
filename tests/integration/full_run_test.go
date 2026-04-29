@@ -38,6 +38,7 @@ func testSetup(t *testing.T) (*runner.Manager, *runner.GRPCServer, func()) {
 		pythonPath = filepath.Join(projectRoot, ".venv", "bin", "python3")
 	}
 	mgr.PythonPath = pythonPath
+	mgr.LibDir = filepath.Join(projectRoot, "scripts", "_lib")
 
 	return mgr, grpcServer, func() { grpcServer.Stop() }
 }
@@ -174,8 +175,10 @@ func TestCancelMidRun(t *testing.T) {
 	msgs := collectMessages(msgCh, 5*time.Second)
 	t.Logf("Got %d remaining messages after cancel", len(msgs))
 
-	// Verify the run ended
-	if mgr.ActiveRuns() != 0 {
-		t.Errorf("expected 0 active runs after cancel, got %d", mgr.ActiveRuns())
+	// Verify the run ended by asserting observable behavior: a follow-up
+	// CancelRun on the same runID must return "not found", which only happens
+	// after waitForExit removes the run from the activeRuns map.
+	if err := mgr.CancelRun(runID); err == nil {
+		t.Error("expected CancelRun on terminated run to return error, got nil")
 	}
 }

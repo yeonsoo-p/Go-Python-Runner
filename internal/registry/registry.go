@@ -6,12 +6,17 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // Param describes a single parameter for a script.
+//
+// All params are string-valued at the protocol level; scripts parse to int/float
+// themselves. A "type" field used to live here for future type-aware rendering,
+// but the UI never branched on it and every script declared "string", so it
+// was removed. Reintroduce it only when there's a concrete UI consumer.
 type Param struct {
 	Name        string `json:"name"`
-	Type        string `json:"type"`
 	Required    bool   `json:"required"`
 	Default     string `json:"default"`
 	Description string `json:"description"`
@@ -68,12 +73,20 @@ func (r *Registry) LoadPlugins(pluginDir string) error {
 	return r.loadDir(pluginDir, "plugin")
 }
 
-// List returns all registered scripts.
+// List returns all registered scripts in deterministic order
+// (builtin before plugin, then by Name).
 func (r *Registry) List() []Script {
 	result := make([]Script, 0, len(r.scripts))
 	for _, s := range r.scripts {
 		result = append(result, s)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Source != result[j].Source {
+			// "builtin" < "plugin" alphabetically — happens to be the order we want
+			return result[i].Source < result[j].Source
+		}
+		return result[i].Name < result[j].Name
+	})
 	return result
 }
 

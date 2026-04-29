@@ -43,7 +43,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 |---|---|
 | Desktop framework | [Wails v3](https://v3alpha.wails.io/) |
 | Backend | Go |
-| Frontend | React 18 + TypeScript + Vite + Tailwind |
+| Frontend | React 19 + TypeScript + Vite + Tailwind |
 | Go ↔ Python | gRPC bidirectional streaming |
 | Schema | Protobuf with `oneof` |
 | Python runtime | [python-build-standalone](https://github.com/indygreg/python-build-standalone) via `uv` |
@@ -64,8 +64,8 @@ A native desktop application that orchestrates bundled Python scripts through a 
 
 **Platform dependencies:**
 
-- **Windows:** [MinGW-w64](https://www.mingw-w64.org/) (GCC for CGO)
-- **Linux (Ubuntu/Debian):** `sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.0-dev`
+- **Windows:** No C toolchain required — SQLite uses the pure-Go [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) driver and Wails v3 talks to WebView2 via DLL bindings (no CGO).
+- **Linux (Ubuntu/Debian):** `sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.0-dev` — Wails v3 links GTK + webkit2gtk via CGO on Linux.
 
 Run `wails3 doctor` to verify your environment is ready.
 
@@ -134,6 +134,9 @@ make lint-frontend     # tsc --noEmit
 | **Cache Produce/Consume** | Cross-process shared memory caching |
 | **File Export** | Native save dialog + file writing |
 | **DB Todo** | SQLite CRUD operations via gRPC |
+| **DB Key-Value** | Read/write operations on the built-in `kv` table |
+| **DB Run History** | Query past runs from the SQLite history table |
+| **Parallel Worker** | Concurrent workers chaining data through the shared cache |
 | **Error Stages** | Partial completion + error propagation |
 
 ## Plugin System

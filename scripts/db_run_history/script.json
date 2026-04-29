@@ -5,14 +5,12 @@
   "params": [
     {
       "name": "limit",
-      "type": "string",
       "required": false,
       "default": "20",
       "description": "Maximum number of recent runs to display"
     },
     {
       "name": "script_filter",
-      "type": "string",
       "required": false,
       "default": "",
       "description": "Filter by script ID (empty = show all)"

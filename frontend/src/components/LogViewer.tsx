@@ -13,19 +13,18 @@ function LogViewer() {
       try {
         const bindings = await import('../../bindings/go-python-runner/internal/services')
         if (bindings.LogService?.GetLogs) {
-          // Fetch all logs; client-side filtering handles source/level
-          // (streamed log:entry events bypass the backend, so filtering
-          // must happen here anyway).
-          const result = await bindings.LogService.GetLogs({
-            Source: '',
-            Level: '',
-            RunID: '',
-            ScriptID: '',
-          })
+          // Backend returns all entries; we filter client-side because
+          // real-time log:entry events bypass the backend anyway.
+          const result = await bindings.LogService.GetLogs()
           setLogs(result || [])
         }
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
         console.warn('Failed to load logs:', e)
+        try {
+          const svc = await import('../../bindings/go-python-runner/internal/services')
+          svc.LogService?.LogError?.('frontend', `Failed to load logs: ${msg}`, {})
+        } catch { /* bindings not available */ }
       }
     }
     loadLogs()
@@ -41,7 +40,12 @@ function LogViewer() {
         })
         cleanupRef.current = unsub
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
         console.warn('Failed to set up log events:', e)
+        try {
+          const svc = await import('../../bindings/go-python-runner/internal/services')
+          svc.LogService?.LogError?.('frontend', `Failed to subscribe to log:entry events: ${msg}`, {})
+        } catch { /* bindings not available */ }
       }
     }
     setupEvents()
@@ -99,7 +103,7 @@ function LogViewer() {
           <div className="p-4 text-slate-500 text-center">No logs</div>
         ) : (
           filteredLogs.map((log, i) => (
-            <div key={i} className="px-3 py-1 border-b border-slate-800 flex gap-3">
+            <div key={`${log.Timestamp}-${i}`} className="px-3 py-1 border-b border-slate-800 flex gap-3">
               <span className={`font-bold ${levelColor(log.Level)}`}>{log.Level}</span>
               <span className="text-slate-500">[{log.Source}]</span>
               <span className="text-slate-300 flex-1">{log.Message}</span>

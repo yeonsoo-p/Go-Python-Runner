@@ -40,6 +40,10 @@ export function useScripts() {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         setLoadError(`Failed to load scripts: ${msg}`)
+        try {
+          const svc = await import('../../bindings/go-python-runner/internal/services')
+          svc.LogService?.LogError?.('frontend', `Failed to load scripts: ${msg}`, {})
+        } catch { /* bindings not available */ }
       } finally {
         setLoading(false)
       }
@@ -85,16 +89,16 @@ export function useScripts() {
         const onProgress = onRunEvent<ProgressEvent>('run:progress', 'running', (run, data) => {
           run.progress = { current: data.current, total: data.total, label: data.label }
         })
+        // Go is the sole emitter of run:status — frontend just renders.
+        // Manager guarantees exactly one terminal status event per run.
         const onStatus = onRunEvent<StatusEvent>('run:status', 'running', (run, data) => {
-          if (run.status !== 'completed' && run.status !== 'failed') {
-            run.status = data.state
-          }
+          run.status = data.state
         })
-        const onError = onRunEvent<ErrorEvent>('run:error', 'failed', (run, data) => {
-          // Ignore error events for runs already in terminal status
-          if (run.status === 'completed' || run.status === 'failed') return
+        // Error events carry content (message + traceback). Status is set
+        // separately by the run:status event from Manager — onError doesn't
+        // touch run.status anymore. (Frontend "shows", Go "manages".)
+        const onError = onRunEvent<ErrorEvent>('run:error', 'running', (run, data) => {
           run.error = { message: data.message, traceback: data.traceback }
-          run.status = 'failed'
         })
         const onData = onRunEvent<DataEvent>('run:data', 'running', (run, data) => {
           // Go []byte is JSON-marshaled as a base64 string by Wails.
@@ -103,7 +107,12 @@ export function useScripts() {
 
         cleanup = [onOutput, onProgress, onStatus, onError, onData].map(unsub => () => unsub())
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
         console.warn('Failed to set up events:', e)
+        try {
+          const svc = await import('../../bindings/go-python-runner/internal/services')
+          svc.LogService?.LogError?.('frontend', `Failed to set up Wails event listeners: ${msg}`, {})
+        } catch { /* bindings not available */ }
       }
     }
 
@@ -141,7 +150,7 @@ export function useScripts() {
         svc.LogService?.LogError?.('frontend', `Failed to start run: ${msg}`, { scriptID })
       } catch { /* bindings not available */ }
       // Surface error in run state so UI can display it
-      const errorRunID = `error-${Date.now()}`
+      const errorRunID = `error-${crypto.randomUUID()}`
       setRuns(prev => {
         const next = new Map(prev)
         next.set(errorRunID, {
@@ -179,7 +188,7 @@ export function useScripts() {
         const svc = await import('../../bindings/go-python-runner/internal/services')
         svc.LogService?.LogError?.('frontend', `Failed to start parallel runs: ${msg}`, { scriptID })
       } catch { /* bindings not available */ }
-      const errorRunID = `error-${Date.now()}`
+      const errorRunID = `error-${crypto.randomUUID()}`
       setRuns(prev => {
         const next = new Map(prev)
         next.set(errorRunID, {

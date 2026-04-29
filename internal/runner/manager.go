@@ -58,6 +58,7 @@ type Manager struct {
 	db         *db.DB
 	logger     *slog.Logger
 	PythonPath string // optional override for python path
+	LibDir     string // path to scripts/_lib (prepended to PYTHONPATH for spawned scripts)
 }
 
 // NewManager creates a new process manager.
@@ -110,7 +111,7 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 	msgCh := m.grpc.RegisterRun(runID)
 
 	// Create and start the process
-	proc := NewProcess(runID, scriptDir, params, m.grpc.Addr())
+	proc := NewProcess(runID, scriptDir, m.LibDir, params, m.grpc.Addr())
 	proc.PythonPath = m.PythonPath
 	if err := proc.Start(); err != nil {
 		m.grpc.UnregisterRun(runID)
@@ -126,9 +127,11 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 		cancel:   proc.Cancel,
 	}
 
-	m.mu.Lock()
-	m.activeRuns[runID] = state
-	m.mu.Unlock()
+	func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.activeRuns[runID] = state
+	}()
 
 	m.logger.Info("run started",
 		"runID", runID,
@@ -179,6 +182,27 @@ func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc 
 	}
 }
 
+// deriveFinalStatus is Manager's authoritative status decision for a finished run.
+// See the trust-order comment in waitForExit for the rule list.
+func (m *Manager) deriveFinalStatus(runID string, exitCode int, waitErr error) RunStatus {
+	if waitErr != nil || exitCode != 0 {
+		return StatusFailed
+	}
+	if m.grpc.GotError(runID) {
+		return StatusFailed
+	}
+	if m.grpc.GotFailedStatus(runID) {
+		return StatusFailed
+	}
+	if m.grpc.GotCompletedStatus(runID) {
+		return StatusCompleted
+	}
+	// Process exited 0 but Python signaled neither completion nor failure.
+	// Treat as a failure so users see a problem rather than a silent
+	// "completed" for a script that crashed before reaching complete()/fail().
+	return StatusFailed
+}
+
 // waitForExit waits for the process to exit, logs stderr if needed, and records the run.
 func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc *Process) {
 	exitCode, stderrOutput, err := proc.Wait()
@@ -188,40 +212,37 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	// (progress, error, status) are delivered before we synthesize a final status.
 	m.grpc.WaitStreamDone(runID, 5*time.Second)
 
-	finalStatus := StatusCompleted
-	if err != nil || exitCode != 0 {
-		finalStatus = StatusFailed
-		// Only log stderr if we didn't already get a structured error via gRPC,
-		// to avoid duplicate error events for the same failure.
-		if stderrOutput != "" && !m.grpc.GotError(runID) {
-			logStderr := stderrOutput
-			if len(logStderr) > maxStderrLog {
-				logStderr = logStderr[:maxStderrLog] + "\n... (truncated)"
-			}
-			m.grpc.TrySendError(runID, logStderr)
-			m.logger.Error("script stderr",
-				"runID", runID,
-				"scriptID", scriptID,
-				"stderr", logStderr,
-				"source", "python",
-			)
+	// Manager is the SOLE authority on terminal run status. Python's StatusMsg
+	// is consumed as a flag (gotCompletedStatus / gotFailedStatus) by the gRPC
+	// handler and never reaches the frontend on its own — this method emits
+	// exactly one run:status event below.
+	//
+	// Trust order:
+	//   1. process exited non-zero  → Failed   (process crashed; ignore Python's intent)
+	//   2. gotError flag            → Failed   (Python called fail())
+	//   3. gotFailedStatus flag     → Failed   (Python sent Status(failed) without ErrorMsg)
+	//   4. gotCompletedStatus flag  → Completed (Python called complete())
+	//   5. otherwise                → Failed   (script exited cleanly without signaling — bug in script)
+	finalStatus := m.deriveFinalStatus(runID, exitCode, err)
+
+	if finalStatus == StatusFailed && exitCode != 0 && stderrOutput != "" && !m.grpc.GotError(runID) {
+		// Process crashed without sending a structured error. Synthesize one
+		// so the frontend's error panel has something to display.
+		logStderr := stderrOutput
+		if len(logStderr) > maxStderrLog {
+			logStderr = logStderr[:maxStderrLog] + "\n... (truncated)"
 		}
+		m.grpc.TrySendError(runID, logStderr)
+		m.logger.Error("script stderr",
+			"runID", runID,
+			"scriptID", scriptID,
+			"stderr", logStderr,
+			"source", "python",
+		)
 	}
 
-	// Python's fail() sends a gRPC Error message but exits with code 0.
-	// Check the gotError flag before UnregisterRun clears the run channel.
-	if finalStatus != StatusFailed && m.grpc.GotError(runID) {
-		finalStatus = StatusFailed
-	}
-
-	// Honor Python's explicit StatusMsg "failed" even without an ErrorMsg.
-	if finalStatus != StatusFailed && m.grpc.GotFailedStatus(runID) {
-		finalStatus = StatusFailed
-	}
-
-	// Guarantee frontend receives terminal status even if Python's
-	// gRPC StatusMsg was lost (stream error, race, etc.).
-	// The channel is buffered and frontend guards ignore duplicates.
+	// Sole emitter of run:status — frontend is guaranteed to receive exactly
+	// one terminal status event per run.
 	m.grpc.TrySendStatus(runID, finalStatus)
 
 	// Capture structured error message before UnregisterRun clears the RunChannel.
@@ -311,28 +332,3 @@ func (m *Manager) CancelRun(runID string) error {
 	return nil
 }
 
-// GetRunHistory returns all completed runs.
-func (m *Manager) GetRunHistory() []RunRecord {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make([]RunRecord, len(m.history))
-	copy(result, m.history)
-	return result
-}
-
-// ActiveRuns returns the number of currently running scripts.
-func (m *Manager) ActiveRuns() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.activeRuns)
-}
-
-// CacheBlocks returns a snapshot of all cache blocks (for diagnostics/testing).
-func (m *Manager) CacheBlocks() map[string]CacheBlock {
-	return m.cache.Blocks()
-}
-
-// CacheLookup returns metadata for a cached block (for diagnostics/testing).
-func (m *Manager) CacheLookup(key string) (shmName string, size int64, found bool) {
-	return m.cache.Lookup(key)
-}

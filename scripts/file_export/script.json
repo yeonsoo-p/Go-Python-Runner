@@ -5,7 +5,6 @@
   "params": [
     {
       "name": "data",
-      "type": "string",
       "required": false,
       "default": "hello,world,foo,bar,42",
       "description": "Comma-separated values to export"

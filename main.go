@@ -86,6 +86,7 @@ func main() {
 
 	// Initialize process manager
 	mgr := runner.NewManager(grpcServer, cache, store, logger)
+	mgr.LibDir = filepath.Join(scriptsDir, "_lib")
 
 	// Create Wails services
 	scriptSvc := services.NewScriptService(reg)

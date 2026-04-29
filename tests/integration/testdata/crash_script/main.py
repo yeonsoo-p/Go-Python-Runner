@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import os
-import sys
+from runner import run
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "_lib"))
 
-from runner import connect, fail
+def main(_params: dict[str, str]) -> None:
+    raise RuntimeError("intentional crash for testing")
+
 
 if __name__ == "__main__":
-    try:
-        connect()
-        raise RuntimeError("intentional crash for testing")
-    except Exception as e:
-        fail(str(e))
+    run(main)

@@ -12,13 +12,9 @@ The `iterations` param controls how many passes run.
 from __future__ import annotations
 
 import json
-import os
-import sys
 from collections import Counter
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
-from runner import complete, connect, fail, output, progress
+from runner import complete, fail, output, progress, run
 
 
 def analyze(text: str, depth: int) -> dict[str, object]:
@@ -70,9 +66,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

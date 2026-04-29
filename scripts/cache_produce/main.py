@@ -7,14 +7,10 @@ when the last handle closes, so the consumer must connect while this is running.
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
 import numpy as np
-from runner import cache_set, complete, connect, fail, output, progress
+from runner import cache_set, complete, fail, output, progress, run
 
 
 def main(params: dict[str, str]) -> None:
@@ -49,9 +45,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

@@ -5,7 +5,7 @@ End users do not need Python, `uv`, or `pip` installed — everything is self-co
 
 ## How it works
 
-- **Source**: `uv python install` downloads a compact Python from [python-build-standalone](https://github.com/indygreg/python-build-standalone) (~50MB after cleanup, vs ~134MB for the raw tarball).
+- **Source**: `uv python install` downloads a compact Python from [python-build-standalone](https://github.com/indygreg/python-build-standalone) (~70MB after cleanup, vs ~134MB for the raw tarball).
 - **Shared deps**: `grpcio`, `protobuf`, and `numpy` are pre-installed via `uv pip install` at build time.
 - **Location**: The `python/` directory sits next to the application executable.
 

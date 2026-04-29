@@ -3,93 +3,158 @@
 package integration
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"go-python-runner/internal/runner"
 )
 
+// TestCacheShareObject verifies the cache contract end-to-end:
+//   - producer caches a dict and holds the handle alive
+//   - consumer running in parallel calls cache_get and receives the same data
+//
+// On Windows the producer must outlive the consumer's open() because the OS
+// reclaims the shm block once the last handle closes; testdata/cache_producer
+// holds for ~10s by default which is comfortably enough for the consumer to
+// attach and unpickle.
 func TestCacheShareObject(t *testing.T) {
-	mgr, grpcSrv, cleanup := testSetup(t)
+	mgr, _, cleanup := testSetup(t)
 	defer cleanup()
-	_ = grpcSrv
 
-	// On Windows, shared memory blocks are destroyed when the last handle closes.
-	// For cross-process sharing, producer and consumer must run concurrently so
-	// the producer's handle is still open when the consumer opens the same block.
-
-	// Start producer — it caches data and keeps running until complete()
+	// Start producer (holds handle for `hold_seconds`).
 	_, prodCh, err := mgr.StartRun("cache_producer", map[string]string{}, testdataDir(t, "cache_producer"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait for producer to output "cached:shared_data" (block is now in shared memory)
-	var producerCached bool
-	timer := time.NewTimer(15 * time.Second)
-	defer timer.Stop()
-waitProducer:
-	for {
-		select {
-		case msg, ok := <-prodCh:
-			if !ok {
-				break waitProducer
-			}
-			if out, ok := msg.(runner.OutputMsg); ok {
-				t.Logf("Producer: %s", out.Text)
-				if out.Text == "cached:shared_data" {
-					producerCached = true
-				}
-			}
-			if _, ok := msg.(runner.StatusMsg); ok {
-				break waitProducer
-			}
-		case <-timer.C:
-			t.Fatal("timeout waiting for producer")
-		}
-	}
-	if !producerCached {
-		t.Fatal("producer did not cache data")
+	// Wait until the producer reports it cached the block. Only then is it safe
+	// to start the consumer — before that, the registry entry isn't yet present.
+	if !waitForOutput(prodCh, "cached:shared_data", 15*time.Second, t) {
+		t.Fatal("producer did not signal cache_set within timeout")
 	}
 
-	// Producer has exited by now (it calls complete() after cache_set).
-	// On Windows the shared memory handle is closed. This test verifies the
-	// Go registry still has the metadata — actual cross-process sharing
-	// requires concurrent runs (see cache_demo sample script).
-	shmName, size, found := mgr.CacheLookup("shared_data")
-	if !found {
-		t.Fatal("cache registry lost the block after producer exited")
-	}
-	t.Logf("Cache block persisted: shm=%s size=%d", shmName, size)
-}
-
-func TestCacheCleanupOnCrash(t *testing.T) {
-	mgr, grpcSrv, cleanup := testSetup(t)
-	defer cleanup()
-	_ = grpcSrv
-
-	// Start crash script — caches data then exits abruptly via os._exit(1)
-	_, crashCh, err := mgr.StartRun("cache_crash", map[string]string{}, testdataDir(t, "cache_crash"))
+	// Start consumer concurrently — producer is still holding its handle.
+	_, consCh, err := mgr.StartRun("cache_consumer", map[string]string{}, testdataDir(t, "cache_consumer"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Collect messages (may be incomplete due to crash)
-	msgs := collectMessages(crashCh, 15*time.Second)
-	t.Logf("Crash script: %d messages", len(msgs))
-
-	// Wait for cleanup goroutine
-	time.Sleep(500 * time.Millisecond)
-
-	// Block persists (available to future consumers) but the crashed run's
-	// ref has been removed. Verify block exists with zero refs.
-	blocks := mgr.CacheBlocks()
-	if block, ok := blocks["crash_data"]; ok {
-		if len(block.Refs) != 0 {
-			t.Errorf("expected zero refs after crash cleanup, got %v", block.Refs)
+	// Drain consumer messages and look for the retrieval payload.
+	var retrieved string
+	var consCompleted bool
+	for msg := range readWithTimeout(consCh, 15*time.Second) {
+		switch m := msg.(type) {
+		case runner.OutputMsg:
+			if strings.HasPrefix(m.Text, "retrieved:") {
+				retrieved = strings.TrimPrefix(m.Text, "retrieved:")
+			}
+		case runner.StatusMsg:
+			if m.State == runner.StatusCompleted {
+				consCompleted = true
+			}
+		case runner.ErrorMsg:
+			t.Errorf("consumer error: %s\n%s", m.Message, m.Traceback)
 		}
-		t.Logf("Orphaned block persists: key=%s, size=%d", block.Key, block.Size)
 	}
-	// Block may or may not exist depending on whether the cache_set message
-	// arrived before the process crash — both outcomes are valid.
+
+	if !consCompleted {
+		t.Fatal("consumer did not complete")
+	}
+	const want = `{"key": "value", "nested": {"a": true}, "numbers": [1, 2, 3]}`
+	if retrieved != want {
+		t.Errorf("consumer retrieved unexpected payload:\n  got:  %s\n  want: %s", retrieved, want)
+	}
+
+	// Drain producer (it'll complete once its hold elapses, well after the consumer).
+	_ = collectMessages(prodCh, 15*time.Second)
+}
+
+// TestCacheCleanupOnCrash verifies that after an owning script crashes, a
+// follow-up consumer cannot access the block — the registry must be cleaned
+// (no stale "found" entry pointing at reclaimed shm).
+func TestCacheCleanupOnCrash(t *testing.T) {
+	mgr, _, cleanup := testSetup(t)
+	defer cleanup()
+
+	// Start crash script — it caches data then os._exit(1).
+	_, crashCh, err := mgr.StartRun("cache_crash", map[string]string{}, testdataDir(t, "cache_crash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectMessages(crashCh, 15*time.Second)
+
+	// Now run a consumer that asks for crash_data. The behavior we care about is
+	// observable from the consumer side: cache_get raises KeyError, which the
+	// runner translates into a failed run with that message.
+	_, consCh, err := mgr.StartRun("cache_consumer_crashkey", map[string]string{}, testdataDir(t, "cache_consumer_crashkey"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sawKeyError, sawFailed bool
+	for msg := range readWithTimeout(consCh, 15*time.Second) {
+		switch m := msg.(type) {
+		case runner.ErrorMsg:
+			if strings.Contains(m.Message, "crash_data") {
+				sawKeyError = true
+			}
+		case runner.StatusMsg:
+			if m.State == runner.StatusFailed {
+				sawFailed = true
+			}
+		}
+	}
+	if !sawKeyError {
+		t.Error("expected consumer's cache_get to raise KeyError for crash_data")
+	}
+	if !sawFailed {
+		t.Error("expected consumer to end with failed status")
+	}
+}
+
+// readWithTimeout returns a channel that yields messages until the source
+// channel closes or the timeout elapses, whichever comes first.
+func readWithTimeout(ch <-chan runner.Message, timeout time.Duration) <-chan runner.Message {
+	out := make(chan runner.Message, 16)
+	go func() {
+		defer close(out)
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					return
+				}
+				out <- msg
+			case <-timer.C:
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// waitForOutput blocks until an OutputMsg matching `text` arrives on `ch`,
+// or the timeout expires. Returns true on hit. Logs every output for triage.
+func waitForOutput(ch <-chan runner.Message, text string, timeout time.Duration, t *testing.T) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case msg, ok := <-ch:
+			if !ok {
+				return false
+			}
+			if out, isOutput := msg.(runner.OutputMsg); isOutput {
+				t.Logf("producer output: %s", out.Text)
+				if out.Text == text {
+					return true
+				}
+			}
+		case <-timer.C:
+			return false
+		}
+	}
 }

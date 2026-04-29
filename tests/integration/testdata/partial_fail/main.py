@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import sys
+from runner import fail, output, progress, run
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "_lib"))
 
-from runner import connect, fail, output, progress
+def main(_params: dict[str, str]) -> None:
+    output("step 1 ok")
+    progress(1, 3, "step 1")
+    output("step 2 ok")
+    progress(2, 3, "step 2")
+    fail("intentional failure at step 3", "partial_fail.main: step=3, total=3")
+
 
 if __name__ == "__main__":
-    try:
-        connect()
-        output("step 1 ok")
-        progress(1, 3, "step 1")
-        output("step 2 ok")
-        progress(2, 3, "step 2")
-        fail("intentional failure at step 3", "partial_fail.main: step=3, total=3")
-    except Exception as e:
-        fail(str(e))
+    run(main)

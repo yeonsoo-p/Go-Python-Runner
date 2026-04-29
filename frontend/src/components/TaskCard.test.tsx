@@ -8,8 +8,9 @@ const mockScript: Script = {
   name: 'Hello World',
   description: 'A simple greeting script',
   params: [
-    { name: 'name', type: 'string', required: false, default: 'World', description: 'Who to greet' }
+    { name: 'name', required: false, default: 'World', description: 'Who to greet' }
   ],
+  parallel: null,
   source: 'builtin',
 }
 

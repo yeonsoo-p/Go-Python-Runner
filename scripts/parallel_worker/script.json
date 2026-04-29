@@ -7,33 +7,38 @@
     "max_workers": 8,
     "vary_param": "worker_name",
     "chain_param": "read_from",
-    "names": ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"]
+    "names": [
+      "Alpha",
+      "Beta",
+      "Gamma",
+      "Delta",
+      "Epsilon",
+      "Zeta",
+      "Eta",
+      "Theta"
+    ]
   },
   "params": [
     {
       "name": "steps",
-      "type": "string",
       "required": false,
       "default": "5",
       "description": "Number of work steps before cache phase"
     },
     {
       "name": "delay",
-      "type": "string",
       "required": false,
       "default": "0.8",
       "description": "Seconds per step (simulates work)"
     },
     {
       "name": "array_size",
-      "type": "string",
       "required": false,
       "default": "1000",
       "description": "Size of numpy array to cache"
     },
     {
       "name": "hold_seconds",
-      "type": "string",
       "required": false,
       "default": "30",
       "description": "Seconds to hold cache handle alive for other workers to read"

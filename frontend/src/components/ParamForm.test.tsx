@@ -15,7 +15,7 @@ describe('ParamForm', () => {
 
   it('renders input fields for params', () => {
     const params: Param[] = [
-      { name: 'name', type: 'string', required: true, default: '', description: 'Your name' },
+      { name: 'name', required: true, default: '', description: 'Your name' },
     ]
     render(<ParamForm params={params} onSubmit={vi.fn()} />)
 
@@ -25,7 +25,7 @@ describe('ParamForm', () => {
 
   it('shows required indicator', () => {
     const params: Param[] = [
-      { name: 'input', type: 'string', required: true, default: '', description: 'test' },
+      { name: 'input', required: true, default: '', description: 'test' },
     ]
     render(<ParamForm params={params} onSubmit={vi.fn()} />)
     expect(screen.getByText('*')).toBeInTheDocument()
@@ -33,7 +33,7 @@ describe('ParamForm', () => {
 
   it('uses default values', () => {
     const params: Param[] = [
-      { name: 'name', type: 'string', required: false, default: 'World', description: 'test' },
+      { name: 'name', required: false, default: 'World', description: 'test' },
     ]
     render(<ParamForm params={params} onSubmit={vi.fn()} />)
     const input = screen.getByDisplayValue('World')
@@ -42,7 +42,7 @@ describe('ParamForm', () => {
 
   it('disables form when disabled prop is true', () => {
     const params: Param[] = [
-      { name: 'name', type: 'string', required: false, default: '', description: 'test' },
+      { name: 'name', required: false, default: '', description: 'test' },
     ]
     render(<ParamForm params={params} onSubmit={vi.fn()} disabled />)
     expect(screen.getByRole('button')).toBeDisabled()

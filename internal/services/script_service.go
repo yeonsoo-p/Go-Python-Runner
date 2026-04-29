@@ -1,8 +1,6 @@
 package services
 
 import (
-	"fmt"
-
 	"go-python-runner/internal/registry"
 )
 
@@ -16,21 +14,9 @@ func NewScriptService(reg *registry.Registry) *ScriptService {
 	return &ScriptService{registry: reg}
 }
 
-// ListScripts returns all registered scripts.
+// ListScripts returns all registered scripts in deterministic order.
+// This is the only method the frontend uses; per-id lookup happens client-side
+// against the cached list, and the plugin directory has no UI surface today.
 func (s *ScriptService) ListScripts() []registry.Script {
 	return s.registry.List()
-}
-
-// GetScript returns a single script by ID.
-func (s *ScriptService) GetScript(id string) (registry.Script, error) {
-	script, ok := s.registry.Get(id)
-	if !ok {
-		return registry.Script{}, fmt.Errorf("script not found: %s", id)
-	}
-	return script, nil
-}
-
-// GetPluginDir returns the plugin directory path.
-func (s *ScriptService) GetPluginDir() string {
-	return s.registry.PluginDir()
 }

@@ -1,0 +1,1 @@
+{"id": "cache_consumer_crashkey", "name": "Cache Consumer (crash key)", "description": "Tries to retrieve a key left orphaned by a crashed producer", "params": []}

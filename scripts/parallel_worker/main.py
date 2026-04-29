@@ -9,24 +9,19 @@ shared memory cache. Example:
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
 import numpy as np
-
 from runner import (
     cache_get,
     cache_release,
     cache_set,
     complete,
-    connect,
     fail,
     is_cancelled,
     output,
     progress,
+    run,
 )
 
 _TASKS = [
@@ -157,9 +152,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

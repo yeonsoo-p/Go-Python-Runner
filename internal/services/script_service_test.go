@@ -34,7 +34,9 @@ func TestScriptService_ListScripts(t *testing.T) {
 	writeTestScript(t, dir, "data", "Data Processor")
 
 	reg := registry.New(testLogger())
-	reg.LoadBuiltin(dir)
+	if err := reg.LoadBuiltin(dir); err != nil {
+		t.Fatal(err)
+	}
 
 	svc := NewScriptService(reg)
 	scripts := svc.ListScripts()
@@ -43,39 +45,31 @@ func TestScriptService_ListScripts(t *testing.T) {
 	}
 }
 
-func TestScriptService_GetScript(t *testing.T) {
+// ListScripts returns scripts in deterministic order (builtin first, then by Name).
+// Locks down the contract that frontend renders consistent task-card ordering.
+func TestScriptService_ListScripts_DeterministicOrder(t *testing.T) {
 	dir := t.TempDir()
-	writeTestScript(t, dir, "hello", "Hello")
+	writeTestScript(t, dir, "zeta", "Zeta")
+	writeTestScript(t, dir, "alpha", "Alpha")
+	writeTestScript(t, dir, "mu", "Mu")
 
 	reg := registry.New(testLogger())
-	reg.LoadBuiltin(dir)
-
-	svc := NewScriptService(reg)
-	script, err := svc.GetScript("hello")
-	if err != nil {
+	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
-	if script.Name != "Hello" {
-		t.Errorf("expected name 'Hello', got %q", script.Name)
-	}
-}
 
-func TestScriptService_GetScript_NotFound(t *testing.T) {
-	reg := registry.New(testLogger())
 	svc := NewScriptService(reg)
-
-	_, err := svc.GetScript("nonexistent")
-	if err == nil {
-		t.Error("expected error for nonexistent script, got nil")
+	first := svc.ListScripts()
+	second := svc.ListScripts()
+	for i := range first {
+		if first[i].ID != second[i].ID {
+			t.Fatalf("ListScripts is non-deterministic at index %d: %q vs %q", i, first[i].ID, second[i].ID)
+		}
 	}
-}
-
-func TestScriptService_GetPluginDir(t *testing.T) {
-	reg := registry.New(testLogger())
-	svc := NewScriptService(reg)
-
-	dir := svc.GetPluginDir()
-	if dir == "" {
-		t.Error("expected non-empty plugin dir")
+	want := []string{"Alpha", "Mu", "Zeta"}
+	for i, name := range want {
+		if first[i].Name != name {
+			t.Errorf("position %d: expected %q, got %q", i, name, first[i].Name)
+		}
 	}
 }

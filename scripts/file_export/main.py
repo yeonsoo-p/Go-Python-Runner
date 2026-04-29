@@ -9,12 +9,8 @@ from __future__ import annotations
 
 import csv
 import io
-import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
-from runner import complete, connect, fail, output, progress, save_file_dialog
+from runner import complete, dialog_save, fail, output, progress, run
 
 
 def main(params: dict[str, str]) -> None:
@@ -25,7 +21,7 @@ def main(params: dict[str, str]) -> None:
     output(f"Data to export: {values}")
 
     progress(2, 3, "Choosing save location")
-    path = save_file_dialog(
+    path = dialog_save(
         title="Export Data",
         filename="export.csv",
         filters=[("CSV Files", "*.csv"), ("Text Files", "*.txt")],
@@ -55,9 +51,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

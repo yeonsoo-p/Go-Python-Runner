@@ -5,14 +5,12 @@
   "params": [
     {
       "name": "input",
-      "type": "string",
       "required": true,
       "default": "",
       "description": "Text to analyze"
     },
     {
       "name": "iterations",
-      "type": "string",
       "required": false,
       "default": "3",
       "description": "Number of analysis passes (each deeper than the last)"

@@ -6,13 +6,9 @@ Exercises: numpy (pre-installed), output, progress, complete, data_result.
 from __future__ import annotations
 
 import json
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
 
 import numpy as np
-from runner import complete, connect, data_result, fail, output, progress
+from runner import complete, data_result, fail, output, progress, run
 
 
 def main(params: dict[str, str]) -> None:
@@ -50,9 +46,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

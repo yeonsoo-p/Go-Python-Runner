@@ -16,6 +16,7 @@ import (
 type Process struct {
 	RunID      string
 	ScriptDir  string
+	LibDir     string // path to scripts/_lib, prepended to PYTHONPATH so scripts can `import runner`
 	Params     map[string]string
 	GRPCAddr   string
 	PythonPath string // optional override for python path
@@ -24,20 +25,23 @@ type Process struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	stderrMu sync.Mutex
-	stderr   bytes.Buffer
+	stderrMu   sync.Mutex
+	stderr     bytes.Buffer
+	stderrDone chan struct{} // closed when the stderr reader goroutine has fully drained the pipe
 }
 
 // NewProcess creates a new process for running a Python script.
-func NewProcess(runID, scriptDir string, params map[string]string, grpcAddr string) *Process {
+func NewProcess(runID, scriptDir, libDir string, params map[string]string, grpcAddr string) *Process {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Process{
-		RunID:     runID,
-		ScriptDir: scriptDir,
-		Params:    params,
-		GRPCAddr:  grpcAddr,
-		ctx:       ctx,
-		cancel:    cancel,
+		RunID:      runID,
+		ScriptDir:  scriptDir,
+		LibDir:     libDir,
+		Params:     params,
+		GRPCAddr:   grpcAddr,
+		ctx:        ctx,
+		cancel:     cancel,
+		stderrDone: make(chan struct{}),
 	}
 }
 
@@ -55,12 +59,22 @@ func (p *Process) Start() error {
 	mainPy := filepath.Join(p.ScriptDir, "main.py")
 	p.cmd = exec.CommandContext(p.ctx, pythonPath, mainPy)
 
-	// Set environment variables for the Python script
-	p.cmd.Env = append(os.Environ(),
+	// Set environment variables for the Python script. PYTHONPATH includes the
+	// runner helper library directory so scripts (including user-installed
+	// plugins) can `import runner` without sys.path manipulation.
+	env := append(os.Environ(),
 		"GRPC_ADDRESS="+p.GRPCAddr,
 		"RUN_ID="+p.RunID,
-		"SCRIPT_DIR="+p.ScriptDir,
 	)
+	if p.LibDir != "" {
+		existing := os.Getenv("PYTHONPATH")
+		if existing == "" {
+			env = append(env, "PYTHONPATH="+p.LibDir)
+		} else {
+			env = append(env, "PYTHONPATH="+p.LibDir+string(os.PathListSeparator)+existing)
+		}
+	}
+	p.cmd.Env = env
 
 	// Capture stderr for crash diagnostics
 	stderrPipe, err := p.cmd.StderrPipe()
@@ -74,8 +88,10 @@ func (p *Process) Start() error {
 		return fmt.Errorf("starting process: %w", err)
 	}
 
-	// Read stderr in background
+	// Read stderr in background. Close stderrDone after the reader has fully
+	// drained the pipe so Wait() can deterministically read p.stderr.
 	go func() {
+		defer close(p.stderrDone)
 		data, err := io.ReadAll(stderrPipe)
 		p.stderrMu.Lock()
 		if err != nil {
@@ -92,6 +108,10 @@ func (p *Process) Start() error {
 // Wait blocks until the process exits and returns the exit code and stderr output.
 func (p *Process) Wait() (exitCode int, stderrOutput string, err error) {
 	err = p.cmd.Wait()
+	// Wait for the stderr reader to finish draining the pipe before reading
+	// the buffer; cmd.Wait() returning does not by itself guarantee the reader
+	// has flushed.
+	<-p.stderrDone
 	p.stderrMu.Lock()
 	stderrOutput = p.stderr.String()
 	p.stderrMu.Unlock()

@@ -23,7 +23,7 @@ func TestNewTestLogger_WritesToBoth(t *testing.T) {
 	}
 
 	// Check ring buffer
-	entries := ring.Entries(LogFilter{})
+	entries := ring.Entries()
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 ring entry, got %d", len(entries))
 	}
@@ -44,7 +44,7 @@ func TestNewTestLogger_LevelExtracted(t *testing.T) {
 
 	logger.Error("something broke", "source", "python", "traceback", "line 42")
 
-	entries := ring.Entries(LogFilter{})
+	entries := ring.Entries()
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
 	}
@@ -64,14 +64,8 @@ func TestNewTestLogger_MultipleMessages(t *testing.T) {
 	logger.Warn("msg2", "source", "backend")
 	logger.Error("msg3", "source", "python")
 
-	entries := ring.Entries(LogFilter{})
+	entries := ring.Entries()
 	if len(entries) != 3 {
 		t.Fatalf("expected 3 entries, got %d", len(entries))
-	}
-
-	// Verify filtering still works through the logger
-	pyEntries := ring.Entries(LogFilter{Source: "python"})
-	if len(pyEntries) != 1 {
-		t.Fatalf("expected 1 python entry, got %d", len(pyEntries))
 	}
 }

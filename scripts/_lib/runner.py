@@ -15,6 +15,7 @@ import queue
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from multiprocessing import shared_memory
 from typing import Any
 
@@ -29,7 +30,10 @@ if _lib_dir not in sys.path:
 runner_pb2 = importlib.import_module("gen.runner_pb2")
 runner_pb2_grpc = importlib.import_module("gen.runner_pb2_grpc")
 
-# Status constants — must match Go RunStatus values
+# Status constants — must match Go RunStatus values.
+# STATUS_RUNNING is included for symmetry with Go/TS even though Python never
+# sends it (Go sets the run to "running" on connect).
+STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 
@@ -232,6 +236,32 @@ def _finish() -> None:
         _reader_thread.join(timeout=5)
 
 
+def run(main_func: Callable[[dict[str, str]], None]) -> None:
+    """Standard entrypoint wrapper.
+
+    Connects to the Go backend, calls ``main_func`` with the params dict,
+    and translates KeyboardInterrupt / SystemExit / Exception into a
+    structured ``fail()``. Scripts should use this instead of inlining their
+    own try/except in ``__main__``.
+
+    Example:
+        from runner import run, output, complete
+
+        def main(params):
+            output("hello")
+            complete()
+
+        if __name__ == "__main__":
+            run(main)
+    """
+    try:
+        main_func(connect())
+    except (KeyboardInterrupt, SystemExit):
+        fail("cancelled")
+    except Exception as e:
+        fail(str(e))
+
+
 def data_result(key: str, value: bytes) -> None:
     """Send a data result (binary) to Go."""
     _send(runner_pb2.ClientMessage(data=runner_pb2.DataResult(key=str(key), value=bytes(value))))
@@ -330,7 +360,7 @@ def cache_release(key: str) -> None:
 # --- File Dialog API ---
 
 
-def open_file_dialog(
+def dialog_open(
     title: str = "",
     directory: str = "",
     filters: list[tuple[str, str]] | None = None,
@@ -373,7 +403,7 @@ def open_file_dialog(
     return str(resp.file_dialog_response.paths[0])
 
 
-def save_file_dialog(
+def dialog_save(
     title: str = "",
     directory: str = "",
     filename: str = "",
@@ -501,7 +531,7 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
         raise RuntimeError(f"SQL error: {resp.db_query_result.error}")
 
     columns = list(resp.db_query_result.columns)
-    return [dict(zip(columns, row.values, strict=False)) for row in resp.db_query_result.rows]
+    return [dict(zip(columns, row.values, strict=True)) for row in resp.db_query_result.rows]
 
 
 def _cleanup_cache() -> None:

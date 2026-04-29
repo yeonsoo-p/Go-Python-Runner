@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=Go Python Runner
+Comment=Desktop app that orchestrates bundled Python scripts through a Go backend
+Exec=/usr/local/bin/go-python-runner %u
+Terminal=false
+Type=Application
+Icon=go-python-runner
+Categories=Utility;Development;
+StartupWMClass=go-python-runner

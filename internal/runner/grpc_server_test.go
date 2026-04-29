@@ -120,7 +120,10 @@ func TestGRPCServer_ProgressMessage(t *testing.T) {
 	}
 }
 
-func TestGRPCServer_StatusMessage(t *testing.T) {
+// Status messages from Python are consumed as Manager-internal flags and
+// MUST NOT be forwarded to the message channel — Manager is the sole emitter
+// of run:status events to the frontend.
+func TestGRPCServer_StatusMessage_UpdatesFlagOnly(t *testing.T) {
 	srv, cleanup := testGRPCServer(t)
 	defer cleanup()
 
@@ -130,26 +133,66 @@ func TestGRPCServer_StatusMessage(t *testing.T) {
 
 	<-srv.WaitConnected("run-3")
 
-	err := stream.Send(&pb.ClientMessage{
-		Msg: &pb.ClientMessage_Status{
-			Status: &pb.Status{State: "completed"},
-		},
-	})
-	if err != nil {
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_Status{Status: &pb.Status{State: "completed"}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
+	// Allow the server goroutine to process the message.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.GotCompletedStatus("run-3") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !srv.GotCompletedStatus("run-3") {
+		t.Fatal("expected GotCompletedStatus(run-3) = true after Status(completed)")
+	}
+	if srv.GotFailedStatus("run-3") {
+		t.Error("did not expect GotFailedStatus(run-3) to be set")
+	}
+
+	// Crucially: the message must NOT have been forwarded to the channel.
 	select {
 	case msg := <-msgCh:
-		s, ok := msg.(StatusMsg)
-		if !ok {
-			t.Fatalf("expected StatusMsg, got %T", msg)
+		t.Fatalf("StatusMsg unexpectedly forwarded to channel: %T %+v — Manager must be the sole emitter", msg, msg)
+	case <-time.After(200 * time.Millisecond):
+		// good — channel is silent, as required.
+	}
+}
+
+func TestGRPCServer_StatusMessage_FailedSetsFlag(t *testing.T) {
+	srv, cleanup := testGRPCServer(t)
+	defer cleanup()
+
+	srv.RegisterRun("run-3-fail")
+	stream, connCleanup := connectClient(t, srv.Addr(), "run-3-fail")
+	defer connCleanup()
+
+	<-srv.WaitConnected("run-3-fail")
+
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_Status{Status: &pb.Status{State: "failed"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.GotFailedStatus("run-3-fail") {
+			break
 		}
-		if s.State != StatusCompleted {
-			t.Errorf("expected state 'completed', got %q", s.State)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !srv.GotFailedStatus("run-3-fail") {
+		t.Fatal("expected GotFailedStatus(run-3-fail) = true after Status(failed)")
+	}
+	if srv.GotCompletedStatus("run-3-fail") {
+		t.Error("did not expect GotCompletedStatus(run-3-fail) to be set")
 	}
 }
 

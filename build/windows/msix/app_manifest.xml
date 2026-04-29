@@ -7,16 +7,16 @@
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   IgnorableNamespaces="uap3">
   
-  <Identity 
-    Name="com.example.gopythonrunner"
-    Publisher="CN=My Company"
-    Version="0.1.0.0" 
+  <Identity
+    Name="com.gopythonrunner.app"
+    Publisher="CN=Go Python Runner"
+    Version="0.1.0.0"
     ProcessorArchitecture="x64" />
-  
+
   <Properties>
-    <DisplayName>My Product</DisplayName>
-    <PublisherDisplayName>My Company</PublisherDisplayName>
-    <Description>A go-python-runner application</Description>
+    <DisplayName>Go Python Runner</DisplayName>
+    <PublisherDisplayName>Go Python Runner</PublisherDisplayName>
+    <Description>Desktop app that orchestrates bundled Python scripts through a Go backend</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   
@@ -29,10 +29,10 @@
   </Resources>
   
   <Applications>
-    <Application Id="com.example.gopythonrunner" Executable="go-python-runner.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="com.gopythonrunner.app" Executable="go-python-runner.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="My Product"
-        Description="A go-python-runner application"
+        DisplayName="Go Python Runner"
+        Description="Desktop app that orchestrates bundled Python scripts through a Go backend"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

@@ -5,21 +5,18 @@
   "params": [
     {
       "name": "key",
-      "type": "string",
       "required": false,
       "default": "shared_array",
       "description": "Cache key name"
     },
     {
       "name": "size",
-      "type": "string",
       "required": false,
       "default": "100",
       "description": "Array size"
     },
     {
       "name": "hold_seconds",
-      "type": "string",
       "required": false,
       "default": "30",
       "description": "How long to keep the shared memory handle alive"

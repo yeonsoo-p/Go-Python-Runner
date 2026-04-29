@@ -5,7 +5,6 @@
   "params": [
     {
       "name": "key",
-      "type": "string",
       "required": false,
       "default": "shared_array",
       "description": "Cache key to retrieve"

@@ -40,19 +40,7 @@ func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID str
 	}
 }
 
-// Lookup returns the shared memory name and size for a given key.
-func (cm *CacheManager) Lookup(key string) (shmName string, size int64, found bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	block, ok := cm.blocks[key]
-	if !ok {
-		return "", 0, false
-	}
-	return block.ShmName, block.Size, true
-}
-
 // LookupAndRef atomically looks up a cache block and adds a reference.
-// This avoids the TOCTOU race of separate Lookup + AddRef calls.
 func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size int64, found bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -69,25 +57,11 @@ func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size in
 	return block.ShmName, block.Size, true
 }
 
-// AddRef adds a run ID reference to a cache block.
-func (cm *CacheManager) AddRef(key, runID string) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	block, ok := cm.blocks[key]
-	if !ok {
-		return
-	}
-	// Don't add duplicate refs
-	for _, ref := range block.Refs {
-		if ref == runID {
-			return
-		}
-	}
-	block.Refs = append(block.Refs, runID)
-}
-
 // Release removes a run ID reference from a cache block.
-// If no references remain, the block is removed from the registry.
+// If no references remain, the block is removed from the registry and the
+// underlying OS shared-memory name is unlinked (on Linux/macOS — see
+// shm_unix.go). On Windows the OS handles reclamation when the last handle
+// closes, so unlinkShm is a no-op there.
 // Returns true if the runID was actually referencing the block, false otherwise.
 func (cm *CacheManager) Release(key, runID string) bool {
 	cm.mu.Lock()
@@ -96,7 +70,6 @@ func (cm *CacheManager) Release(key, runID string) bool {
 	if !ok {
 		return false
 	}
-	// Remove the runID from refs
 	found := false
 	for i, ref := range block.Refs {
 		if ref == runID {
@@ -105,19 +78,20 @@ func (cm *CacheManager) Release(key, runID string) bool {
 			break
 		}
 	}
-	// If no refs remain, remove the block
-	// On Windows, shared memory is auto-cleaned when all handles close.
 	if len(block.Refs) == 0 {
+		unlinkShm(block.ShmName)
 		delete(cm.blocks, key)
 	}
 	return found
 }
 
 // CleanupRun removes a terminated run's references from all cache blocks.
-// Blocks with zero remaining references are deleted from the registry.
-// On Windows, the OS reclaims shared memory when the last handle closes,
-// so keeping zero-ref blocks would leave stale metadata that causes
-// cache_get to report "found" for memory that no longer exists.
+// Blocks with zero remaining references are deleted from the registry and
+// their underlying OS shared-memory names are unlinked (on Linux/macOS).
+// This plugs the leak when an owning Python process crashes via os._exit()
+// or SIGKILL — its atexit handler doesn't run, but Go cleans up here.
+// On Windows, the OS reclaims pagefile-backed shm when the last handle
+// closes, so the unlinkShm call is a no-op.
 func (cm *CacheManager) CleanupRun(runID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -129,18 +103,9 @@ func (cm *CacheManager) CleanupRun(runID string) {
 			}
 		}
 		if len(block.Refs) == 0 {
+			unlinkShm(block.ShmName)
 			delete(cm.blocks, key)
 		}
 	}
 }
 
-// Blocks returns a snapshot of all cache blocks (for diagnostics).
-func (cm *CacheManager) Blocks() map[string]CacheBlock {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	result := make(map[string]CacheBlock, len(cm.blocks))
-	for k, v := range cm.blocks {
-		result[k] = *v
-	}
-	return result
-}

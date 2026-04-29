@@ -1,4 +1,4 @@
-.PHONY: proto bindings test test-go test-integration test-python test-frontend lint lint-go lint-python lint-frontend dev build bundle-python installer clean
+.PHONY: proto bindings codegen test test-go test-integration test-python test-frontend lint lint-go lint-python lint-frontend dev build bundle-python installer clean clean-generated
 
 # --- Code Generation ---
 
@@ -15,20 +15,25 @@ proto:
 bindings:
 	wails3 generate bindings
 
+# Run both codegen steps in one target. `proto` produces Go + Python protobuf
+# code, `bindings` produces TypeScript bindings; both are gitignored, so
+# every other target that compiles depends on this.
+codegen: proto bindings
+
 # --- Testing ---
 
 test: test-go test-python test-frontend test-integration
 
-test-go:
+test-go: codegen
 	go test ./internal/...
 
-test-integration:
+test-integration: codegen
 	go test ./tests/integration/ -tags=integration -v -timeout=120s
 
-test-python:
+test-python: codegen
 	uv run pytest scripts/_lib/tests/
 
-test-frontend:
+test-frontend: codegen
 	cd frontend && npx vitest run
 
 # --- Linting ---
@@ -54,7 +59,7 @@ dev:
 
 # --- Build ---
 
-build:
+build: codegen
 	cd frontend && npm run build
 	wails3 build
 	uv run python -c "import shutil,os; dst='bin/scripts'; shutil.rmtree(dst,True); shutil.copytree('scripts',dst,ignore=shutil.ignore_patterns('tests','__pycache__'))"
@@ -63,7 +68,7 @@ build:
 bundle-python:
 	uv run python build/bundle_python.py
 
-installer: proto bundle-python build
+installer: codegen bundle-python build
 	wails3 task windows:create:nsis:installer
 
 # --- Cleanup ---
@@ -71,3 +76,6 @@ installer: proto bundle-python build
 clean:
 	go clean -cache
 	uv run python -c "import shutil, os; [shutil.rmtree(p) for p in ['frontend/dist', 'bin'] if os.path.isdir(p)]"
+
+clean-generated:
+	uv run python -c "import shutil, os; [shutil.rmtree(p) for p in ['internal/gen', 'scripts/_lib/gen', 'frontend/bindings'] if os.path.isdir(p)]"

@@ -48,20 +48,3 @@ func TestRunnerService_CancelRun_NotFound(t *testing.T) {
 	}
 }
 
-func TestRunnerService_GetRunHistory_Empty(t *testing.T) {
-	cache := runner.NewCacheManager()
-	grpcSrv, err := runner.NewGRPCServer(cache, testDB(t), testLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer grpcSrv.Stop()
-
-	mgr := runner.NewManager(grpcSrv, cache, testDB(t), testLogger())
-	reg := registry.New(testLogger())
-	svc := NewRunnerService(mgr, reg, testLogger())
-
-	history := svc.GetRunHistory()
-	if len(history) != 0 {
-		t.Errorf("expected empty history, got %d entries", len(history))
-	}
-}

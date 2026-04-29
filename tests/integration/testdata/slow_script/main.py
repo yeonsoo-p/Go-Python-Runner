@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import os
-import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "_lib"))
+from runner import complete, output, progress, run
 
-from runner import complete, connect, fail, output, progress
+
+def main(_params: dict[str, str]) -> None:
+    output("starting slow work")
+    for i in range(30):
+        progress(i + 1, 30, "working")
+        time.sleep(1)
+    complete()
+
 
 if __name__ == "__main__":
-    try:
-        connect()
-        output("starting slow work")
-        for i in range(30):
-            progress(i + 1, 30, "working")
-            time.sleep(1)
-        complete()
-    except Exception as e:
-        fail(str(e))
+    run(main)

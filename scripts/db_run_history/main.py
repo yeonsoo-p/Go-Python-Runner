@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_lib"))
-
-from runner import complete, connect, db_query, fail, output, progress
+from runner import complete, db_query, fail, output, progress, run
 
 
 def show_runs(limit: str, script_filter: str) -> None:
@@ -16,11 +11,9 @@ def show_runs(limit: str, script_filter: str) -> None:
     if script_filter:
         rows = db_query(
             "SELECT id, script_id, status, params, started_at, finished_at, exit_code, error_message "
-            "FROM runs ORDER BY started_at DESC LIMIT ?",
-            [limit],
+            "FROM runs WHERE script_id = ? ORDER BY started_at DESC LIMIT ?",
+            [script_filter, limit],
         )
-        # Filter in Python since we have simple needs
-        rows = [r for r in rows if r["script_id"] == script_filter]
         output(f"=== Recent runs for script '{script_filter}' (limit {limit}) ===")
     else:
         rows = db_query(
@@ -78,9 +71,4 @@ def main(params: dict[str, str]) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main(connect())
-    except (KeyboardInterrupt, SystemExit):
-        fail("cancelled")
-    except Exception as e:
-        fail(str(e))
+    run(main)

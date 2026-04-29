@@ -85,10 +85,8 @@ go-python-runner/
 │   │   ├── gen/                   # Generated protobuf Python code
 │   │   │   ├── runner_pb2.py
 │   │   │   └── runner_pb2_grpc.py
-│   │   └── tests/                 # Python tests
-│   │       ├── test_runner.py     # Unit tests for helper lib
-│   │       ├── test_grpc_client.py # Service tests for gRPC client
-│   │       └── test_integration.py # Integration with Go server
+│   │   └── tests/                 # Python helper unit tests (Go integration tests live in tests/integration/)
+│   │       └── test_runner.py     # Unit tests for helper lib
 │   ├── hello_world/               # Simple greeting (output, progress)
 │   │   ├── script.json
 │   │   └── main.py
@@ -114,6 +112,9 @@ go-python-runner/
 │   │   ├── script.json
 │   │   └── main.py
 │   ├── db_run_history/            # Query run history from SQLite (db_query)
+│   │   ├── script.json
+│   │   └── main.py
+│   ├── parallel_worker/           # Concurrent worker demo (parallel runs)
 │   │   ├── script.json
 │   │   └── main.py
 │   └── error_stages/              # Partial failure (error propagation path)
@@ -146,6 +147,7 @@ go-python-runner/
 │       ├── parallel_test.go
 │       ├── plugin_test.go
 │       ├── error_propagation_test.go
+│       ├── cache_test.go
 │       └── testdata/              # Fixture scripts for tests
 │           ├── echo_script/
 │           ├── crash_script/
@@ -155,7 +157,7 @@ go-python-runner/
 │           ├── cache_consumer/
 │           └── cache_crash/
 ├── build/
-│   └── bundle_python.sh           # Download + package portable Python
+│   └── bundle_python.py           # Download + package portable Python
 ├── Makefile                       # Build + test orchestration
 └── CLAUDE.md
 ```
@@ -171,27 +173,38 @@ One bidirectional streaming RPC (`Execute`). Message direction follows gRPC clie
 
 ## Wails v3 Services
 
+### Architecture philosophy: Frontend shows, Go manages, Python does
+
+| Layer | Role |
+| --- | --- |
+| React (frontend) | **Shows.** Renders state from events. No state-machine logic, no dedup guards. |
+| Go (backend) | **Manages.** Sole authority on run lifecycle and `run:status` events. Owns process supervision, cache registry, DB. |
+| Python (scripts) | **Does.** Performs the actual work. Reports outcomes (output, progress, error) to Go. |
+| Wails / gRPC | **Propagates.** Pure transport. The gRPC handler updates Manager-internal flags from Python's `Status` messages but never forwards them to the frontend — Manager is the single emitter. |
+
 ### ScriptService
 
 Exposed to frontend via auto-generated TypeScript bindings:
 
-- `ListScripts() []Script` — returns all registered scripts with metadata
-- `GetScript(id string) Script` — single script details including parameter schema
+- `ListScripts() []Script` — returns all registered scripts with metadata, in deterministic order (builtin first, then by Name)
 
 ### RunnerService
 
 Exposed via bindings (methods) + events (real-time updates):
 
 - `StartRun(scriptID string, params map[string]string) string` — returns runID
-- `CancelRun(runID string) error` — graceful cancellation
-- `GetRunHistory() []RunRecord` — past executions
+- `StartParallelRuns(scriptID string, params map[string]string, workerCount int) []string` — fan-out via the script's parallel config
+- `CancelRun(runID string) error` — graceful cancellation; returns error if runID is unknown (this is the canonical "did the run terminate?" signal)
+
+Run history is exposed as a Python script (`db_run_history`) that queries the SQLite `runs` table directly, not as a Wails binding. The Go side writes the table; consumers read it via the same DB path.
 
 Emits Wails events:
 
 - `run:output` — stdout text from script
 - `run:progress` — progress updates (current/total/label)
-- `run:status` — state transitions (running/completed/failed)
-- `run:error` — error messages with traceback
+- `run:status` — state transitions (running → completed | failed). Emitted exactly once at the terminal state by `Manager.waitForExit`. Python's `complete()` / `fail()` calls feed flags into Manager's derivation but do not produce frontend events on their own.
+- `run:error` — error messages with traceback (content; status is set by `run:status`)
+- `run:data` — structured data results (key + value bytes from `data_result()`)
 
 ## Go Concurrency Model
 
@@ -271,19 +284,36 @@ Each script lives in `scripts/<name>/` with two files:
 
 ### script.json (metadata)
 
-JSON file with fields: `id`, `name`, `description`, `params[]` (each with `name`, `type`, `required`, `default`, `description`). See `scripts/hello_world/script.json` for a working example.
+JSON file with fields: `id`, `name`, `description`, `params[]` (each with `name`, `required`, `default`, `description`). See `scripts/hello_world/script.json` for a working example.
 
 ### main.py (entry point)
 
-Scripts add `_lib` to `sys.path`, then import from the `runner` helper module. The lifecycle is:
+Scripts import from the `runner` helper module — Go sets `PYTHONPATH` to include `scripts/_lib` when spawning each subprocess, so plugin scripts placed in `~/.go-python-runner/scripts/` import the same way without `sys.path` manipulation.
 
-1. `connect()` — establishes a bidirectional gRPC stream, waits for `StartRequest` from Go, returns the params dict
-2. Script logic — calls any combination of:
-   - `output()`, `progress()`, `data_result()` — send results to frontend
-   - `cache_set()`/`cache_get()`/`cache_release()` — shared memory between scripts
-   - `open_file_dialog()`/`save_file_dialog()` — native OS file pickers
-   - `db_execute()`/`db_query()` — SQLite database access
-3. `complete()` or `fail()` — closes the send stream and drains until Go confirms receipt (EOF), guaranteeing all messages are delivered before the process exits
+The standard entrypoint is `runner.run(main_func)`, which connects, calls `main_func(params)`, and translates `KeyboardInterrupt` / `SystemExit` / `Exception` into a structured `fail()`. A minimal script:
+
+```python
+from runner import run, output, complete
+
+def main(params):
+    output(f"Hello, {params['name']}")
+    complete()
+
+if __name__ == "__main__":
+    run(main)
+```
+
+Inside `main`, scripts call any combination of:
+
+- `output()`, `progress()`, `data_result()` — send results to frontend
+- `complete()` — signal successful completion to Go
+- `fail(msg, tb=None)` — signal failure with optional explicit traceback (defaults to `traceback.format_exc()`)
+- `cache_set()`/`cache_get()`/`cache_release()` — shared memory between scripts
+- `dialog_open()`/`dialog_save()` — native OS file pickers
+- `db_execute()`/`db_query()` — SQLite database access
+- `is_cancelled()` — non-blocking check for Go-initiated cancellation (cooperative stop for long-running loops)
+
+`runner.run(main)` ensures `complete()` or `fail()` is invoked exactly once before the process exits, which closes the send stream and drains until Go confirms receipt (EOF) — this guarantees all messages are delivered before the process terminates.
 
 See `scripts/hello_world/main.py` for the simplest example, `scripts/numpy_stats/main.py` for pre-installed packages, `scripts/cache_produce/main.py` and `scripts/cache_consume/main.py` for shared memory caching, `scripts/file_export/main.py` for native file dialogs, and `scripts/db_todo/main.py` for database access.
 
@@ -314,7 +344,7 @@ End users get a bundled portable Python interpreter — no `uv`, no `pip`, no sy
 - **Source**: [python-build-standalone](https://github.com/indygreg/python-build-standalone) — pre-built portable Python for Windows/Linux
 - **Location**: `python/` directory next to the executable
 - **Shared deps**: `grpcio`, `protobuf`, `numpy` — pre-installed into `site-packages` at build time (see `python/requirements.txt`)
-- **Build script**: `build/bundle_python.sh` downloads portable Python + installs deps from `python/requirements.txt`
+- **Build script**: `build/bundle_python.py` downloads portable Python + installs deps from `python/requirements.txt`
 
 ### How Go finds Python
 
@@ -361,7 +391,7 @@ Users can override built-in scripts or add new ones after the binary is built an
 ### Frontend behavior
 
 - TaskCard displays a badge/indicator distinguishing plugin scripts from built-in
-- `ScriptService.GetPluginDir() string` — exposes the plugin directory path so users know where to place scripts
+- The plugin directory path is documented (Windows / Linux paths above) but is not surfaced via a Wails method today; if a UI affordance for "open plugin folder" is needed, add a `ScriptService.GetPluginDir()` method and an `Open Folder` button
 
 ### Safety
 
@@ -435,8 +465,8 @@ A run's true state is the combination of multiple independent variables across l
 
 ```text
 REGISTERED
-│  Go: RegisterRun() creates RunChannel (stream=nil, connected=open)
-│  manager.go:62
+│  Go: GRPCServer.RegisterRun() creates RunChannel (stream=nil, connected=open)
+│  grpc_server.go:RegisterRun (called from manager.go:StartRun)
 │
 ├─ proc.Start() succeeds
 ▼
@@ -543,15 +573,11 @@ Test each service layer with real dependencies (gRPC, filesystem) but without th
 
 **Go Wails services** (`internal/services/*_test.go`):
 
-- `ScriptService`: real registry with temp script dirs, verify `ListScripts`/`GetScript` return correct data
+- `ScriptService`: real registry with temp script dirs, verify `ListScripts` returns scripts in deterministic order
 - `RunnerService`: mock the manager interface, verify `StartRun` returns runID, `CancelRun` propagates
-- `LogService`: real logger + ring buffer, call `LogError`, verify `GetLogs` returns the entry with correct fields
+- `LogService`: real logger + ring buffer, call `LogError`, verify `GetLogs()` (no filter — backend returns all, client filters) returns the entry with correct fields
 
-**Python gRPC client** (`scripts/_lib/tests/test_grpc_client.py`):
-
-- Start a mock gRPC server in-process
-- Call helper functions (`output`, `progress`, `complete`)
-- Verify the server receives correct protobuf messages
+**Python gRPC client** — covered by the Go integration tests in `tests/integration/` (which spawn real Python subprocesses against a real Go gRPC server). The Python helper itself is exercised through unit tests in `scripts/_lib/tests/test_runner.py`.
 
 ### Integration Tests
 
@@ -652,7 +678,7 @@ uv run mypy scripts/_lib/runner.py               # Python types
 cd frontend && npx tsc --noEmit                  # TypeScript
 
 # Bundle Python runtime for distribution
-bash build/bundle_python.sh
+uv run python build/bundle_python.py
 
 # Production build
 wails3 build

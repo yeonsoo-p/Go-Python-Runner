@@ -72,6 +72,16 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 		workerCount = pc.MaxWorkers
 	}
 
+	// One canonical name resolver. Used both for the worker's own name and for
+	// the chain link to its predecessor, so the Names[]/Worker-N fallback is
+	// expressed exactly once.
+	nameForIndex := func(idx int) string {
+		if idx < len(pc.Names) {
+			return pc.Names[idx]
+		}
+		return fmt.Sprintf("Worker-%d", idx+1)
+	}
+
 	var runIDs []string
 	for i := 0; i < workerCount; i++ {
 		// Clone params so each worker gets its own copy.
@@ -80,22 +90,12 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 			wp[k] = v
 		}
 
-		// Assign unique worker name.
-		if i < len(pc.Names) {
-			wp[pc.VaryParam] = pc.Names[i]
-		} else {
-			wp[pc.VaryParam] = fmt.Sprintf("Worker-%d", i+1)
-		}
+		wp[pc.VaryParam] = nameForIndex(i)
 
-		// Auto-chain: worker[i] reads from worker[i-1].
+		// Auto-chain: worker[i] reads from worker[i-1]. Worker 0 gets empty.
 		if pc.ChainParam != "" {
 			if i > 0 {
-				wp[pc.ChainParam] = wp[pc.VaryParam] // will be overwritten below
-				if i-1 < len(pc.Names) {
-					wp[pc.ChainParam] = pc.Names[i-1]
-				} else {
-					wp[pc.ChainParam] = fmt.Sprintf("Worker-%d", i)
-				}
+				wp[pc.ChainParam] = nameForIndex(i - 1)
 			} else {
 				wp[pc.ChainParam] = ""
 			}
@@ -105,7 +105,13 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 		if err != nil {
 			// Cancel already-started runs on failure.
 			for _, id := range runIDs {
-				_ = s.manager.CancelRun(id)
+				if cancelErr := s.manager.CancelRun(id); cancelErr != nil {
+					s.logger.Warn("rollback cancel failed",
+						"runID", id,
+						"error", cancelErr.Error(),
+						"source", "backend",
+					)
+				}
 			}
 			return nil, fmt.Errorf("starting worker %d for %s: %w", i, scriptID, err)
 		}
@@ -120,11 +126,6 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 // CancelRun cancels a running script.
 func (s *RunnerService) CancelRun(runID string) error {
 	return s.manager.CancelRun(runID)
-}
-
-// GetRunHistory returns all completed runs.
-func (s *RunnerService) GetRunHistory() []runner.RunRecord {
-	return s.manager.GetRunHistory()
 }
 
 func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner.Message) {

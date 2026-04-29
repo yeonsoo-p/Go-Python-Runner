@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import sys
+from runner import complete, output, progress, run
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "scripts", "_lib"))
 
-from runner import complete, connect, fail, output, progress
+def main(params: dict[str, str]) -> None:
+    message = params.get("message", "hello")
+    output(f"echo: {message}")
+    for i in range(3):
+        progress(i + 1, 3, "echoing")
+    complete()
+
 
 if __name__ == "__main__":
-    try:
-        params = connect()
-        message = params.get("message", "hello")
-        output(f"echo: {message}")
-        for i in range(3):
-            progress(i + 1, 3, "echoing")
-        complete()
-    except Exception as e:
-        fail(str(e))
+    run(main)

@@ -3,26 +3,26 @@
 #
 # The lines below are called `modelines`. See `:help modeline`
 
-name: "go-python-runner.exe"
+name: "go-python-runner"
 arch: ${GOARCH}
 platform: "linux"
 version: "0.1.0"
 section: "default"
 priority: "extra"
 maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
-description: "A go-python-runner application"
-vendor: "My Company"
-homepage: "https://wails.io"
+description: "Desktop app that orchestrates bundled Python scripts through a Go backend"
+vendor: "Go Python Runner"
+homepage: "https://github.com/anthropics/go-python-runner"
 license: "MIT"
 release: "1"
 
 contents:
-  - src: "./bin/go-python-runner.exe"
-    dst: "/usr/local/bin/go-python-runner.exe"
+  - src: "./bin/go-python-runner"
+    dst: "/usr/local/bin/go-python-runner"
   - src: "./build/appicon.png"
-    dst: "/usr/share/icons/hicolor/128x128/apps/go-python-runner.exe.png"
-  - src: "./build/linux/go-python-runner.exe.desktop"
-    dst: "/usr/share/applications/go-python-runner.exe.desktop"
+    dst: "/usr/share/icons/hicolor/128x128/apps/go-python-runner.png"
+  - src: "./build/linux/go-python-runner.desktop"
+    dst: "/usr/share/applications/go-python-runner.desktop"
 
 # Default dependencies for Debian 12/Ubuntu 22.04+ with WebKit 4.1
 depends:
