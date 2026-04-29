@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -187,7 +186,9 @@ func TestCancelDuringHandshake(t *testing.T) {
 	}
 }
 
-// TestDoubleCancelIdempotent — second cancel returns "run not found" cleanly.
+// TestDoubleCancelIdempotent — second cancel returns ErrRunNotActive cleanly.
+// CancelGroup uses errors.Is(err, ErrRunNotActive) to filter sibling workers
+// that already terminated; this test pins that contract at the unit level.
 func TestDoubleCancelIdempotent(t *testing.T) {
 	mgr, cleanup := stressSetup(t)
 	defer cleanup()
@@ -203,14 +204,11 @@ func TestDoubleCancelIdempotent(t *testing.T) {
 	}
 	drain(msgCh, 10*time.Second)
 
-	// At this point the run is removed from activeRuns. Second cancel must error cleanly.
+	// At this point the run is removed from activeRuns. Second cancel must
+	// return the ErrRunNotActive sentinel.
 	err = mgr.CancelRun(runID)
-	if err == nil {
-		t.Errorf("second CancelRun returned nil error; expected 'run not found'")
-		return
-	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("expected 'not found' error, got: %v", err)
+	if !errors.Is(err, runner.ErrRunNotActive) {
+		t.Errorf("second CancelRun: expected errors.Is(ErrRunNotActive), got: %v", err)
 	}
 }
 

@@ -22,13 +22,15 @@ func Open(dsn string) (*DB, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	// For in-memory databases, restrict to a single connection so all
-	// queries use the same underlying database. Without this, Go's sql.DB
-	// connection pool may open multiple connections, each with its own
-	// independent in-memory database.
-	if dsn == ":memory:" {
-		db.SetMaxOpenConns(1)
-	}
+	// Single connection for both in-memory and file-backed databases:
+	//   - In-memory: each pooled connection has its own independent DB.
+	//   - File-backed: concurrent writers race for the SQLite file lock;
+	//     under load the busy_timeout retry can still surface SQLITE_BUSY
+	//     (e.g. parallel waitForExit goroutines + Python db_execute).
+	// Serializing at the Go pool layer eliminates both classes of bug. It
+	// also guarantees the PRAGMAs below apply for the process lifetime —
+	// they're set on the only connection that ever exists.
+	db.SetMaxOpenConns(1)
 
 	// Set pragmas for performance and correctness.
 	pragmas := []string{

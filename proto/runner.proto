@@ -54,7 +54,12 @@ message Progress {
 }
 
 message Status {
-  // "running", "completed", "failed"
+  // Canonical values: "running" | "completed" | "failed" | "cancelled".
+  // Open string (not enum) by design — the four-layer alignment lives in
+  // Go (RunStatus consts), Python (STATUS_* consts), and TypeScript (the
+  // RunStatus union). Manager is the sole authority on terminal state;
+  // Python emits "completed" and "failed", and "cancelled" is set on the
+  // Go side when CancelRun was invoked.
   string state = 1;
 }
 

@@ -48,6 +48,7 @@ function RunOutput({ run }: RunOutputProps) {
         <span className={`text-xs px-2 py-0.5 rounded ${
           run.status === 'completed' ? 'bg-green-900 text-green-300'
           : run.status === 'failed' ? 'bg-red-900 text-red-300'
+          : run.status === 'cancelled' ? 'bg-slate-700 text-slate-300'
           : 'bg-yellow-900 text-yellow-300'
         }`}>
           {run.status}

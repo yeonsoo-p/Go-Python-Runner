@@ -27,13 +27,14 @@ function AggregateRunPanel({ group, runs, onCancelGroup, onCancelRun }: Aggregat
   }, [runs])
 
   const counts = useMemo(() => {
-    let running = 0, done = 0, failed = 0
+    let running = 0, done = 0, failed = 0, cancelled = 0
     for (const r of runs) {
       if (r.status === 'running') running++
       else if (r.status === 'completed') done++
       else if (r.status === 'failed') failed++
+      else if (r.status === 'cancelled') cancelled++
     }
-    return { running, done, failed }
+    return { running, done, failed, cancelled }
   }, [runs])
 
   const hasRunning = counts.running > 0
@@ -65,6 +66,11 @@ function AggregateRunPanel({ group, runs, onCancelGroup, onCancelRun }: Aggregat
         <span className="px-2 py-0.5 rounded bg-red-900 text-red-300">
           {counts.failed} failed
         </span>
+        {counts.cancelled > 0 && (
+          <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-300">
+            {counts.cancelled} cancelled
+          </span>
+        )}
       </div>
 
       <button

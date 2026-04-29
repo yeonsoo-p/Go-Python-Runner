@@ -31,11 +31,15 @@ runner_pb2 = importlib.import_module("gen.runner_pb2")
 runner_pb2_grpc = importlib.import_module("gen.runner_pb2_grpc")
 
 # Status constants — must match Go RunStatus values.
-# STATUS_RUNNING is included for symmetry with Go/TS even though Python never
-# sends it (Go sets the run to "running" on connect).
+# STATUS_RUNNING / STATUS_CANCELLED are included for symmetry with Go/TS even
+# though Python never emits them. Manager is the authoritative status source
+# (see CLAUDE.md "Frontend shows, Go manages, Python does"). Cancellation is
+# observed by Python via is_cancelled() / CancelledError, but the terminal
+# status itself is set on the Go side when CancelRun was invoked.
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
 
 # Severity constants — must match proto runner.Severity enum values and Go
 # notify.Severity ordering. Used by fail()/error()/warn()/info() to classify

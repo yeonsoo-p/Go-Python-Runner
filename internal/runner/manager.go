@@ -22,11 +22,12 @@ const (
 	StatusRunning   RunStatus = "running"
 	StatusCompleted RunStatus = "completed"
 	StatusFailed    RunStatus = "failed"
+	StatusCancelled RunStatus = "cancelled"
 )
 
 // IsTerminal returns true if the status represents a final state.
 func (s RunStatus) IsTerminal() bool {
-	return s == StatusCompleted || s == StatusFailed
+	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
 }
 
 // RunState tracks the state of a single script execution.
@@ -37,6 +38,12 @@ type RunState struct {
 	process  *Process
 	messages <-chan Message
 	cancel   func()
+	// cancelRequested is set by CancelRun under Manager.mu and read by
+	// deriveFinalStatus to override the final status to StatusCancelled
+	// regardless of how the process exits or what Python signals. This is
+	// the single structural fact that distinguishes user-driven cancel
+	// from genuine failure.
+	cancelRequested bool
 }
 
 // RunRecord is a completed run entry for history.
@@ -83,7 +90,7 @@ func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, reservoir n
 func (m *Manager) loadHistory() {
 	rows, err := m.db.Query(
 		"SELECT id, script_id, status, started_at, finished_at FROM runs " +
-			"WHERE status IN ('completed', 'failed') ORDER BY started_at DESC",
+			"WHERE status IN ('completed', 'failed', 'cancelled') ORDER BY started_at DESC",
 	)
 	if err != nil {
 		m.reservoir.Report(notify.Event{
@@ -230,6 +237,14 @@ func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc 
 // deriveFinalStatus is Manager's authoritative status decision for a finished run.
 // See the trust-order comment in waitForExit for the rule list.
 func (m *Manager) deriveFinalStatus(runID string, exitCode int, waitErr error) RunStatus {
+	// Rule 0: user-driven cancellation overrides everything below. A
+	// cancelled run is not a failure — even if the kill produced a non-zero
+	// exit, even if Python's cooperative cancel path called fail(), the
+	// terminal state is StatusCancelled. This is the single fact that
+	// keeps cancellation from being conflated with failure downstream.
+	if m.WasCancelled(runID) {
+		return StatusCancelled
+	}
 	if waitErr != nil || exitCode != 0 {
 		return StatusFailed
 	}
@@ -248,6 +263,54 @@ func (m *Manager) deriveFinalStatus(runID string, exitCode int, waitErr error) R
 	return StatusFailed
 }
 
+// WasCancelled reports whether CancelRun has been called for this run. Used
+// by RunnerService.forwardMessages to demote in-flight ErrorMsgs from
+// cancelled runs to log-only routing (Python's cooperative-cancel path
+// emits fail("Cancelled by user"), which would otherwise surface as a
+// per-run error pane).
+func (m *Manager) WasCancelled(runID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.activeRuns[runID]; ok {
+		return s.cancelRequested
+	}
+	return false
+}
+
+// RegisterActiveRunForTest installs a minimal RunState in the activeRuns map
+// without spawning a Python process. Test-only — production code only adds
+// to activeRuns via StartRun. Cross-package tests (e.g. RunnerService unit
+// tests in internal/services) need this to exercise WasCancelled / CancelRun
+// against a Manager without a live subprocess.
+func (m *Manager) RegisterActiveRunForTest(runID, scriptID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activeRuns[runID] = &RunState{
+		RunID:    runID,
+		ScriptID: scriptID,
+		Status:   StatusRunning,
+		cancel:   func() {},
+	}
+}
+
+// GRPCServer returns the underlying gRPC server. Test-only accessor used by
+// cross-package tests to register/unregister run channels without spawning
+// a Python subprocess. Production code reaches the gRPC server through
+// constructor injection, not this getter.
+func (m *Manager) GRPCServer() *GRPCServer { return m.grpc }
+
+// History returns a snapshot of completed-run records, newest first by index
+// of insertion. Used by integration / stress tests that need to assert
+// terminal state without relying on the gRPC server's per-run channels
+// (which are unregistered as soon as a run completes).
+func (m *Manager) History() []RunRecord {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]RunRecord, len(m.history))
+	copy(out, m.history)
+	return out
+}
+
 // waitForExit waits for the process to exit, logs stderr if needed, and records the run.
 func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc *Process) {
 	exitCode, stderrOutput, err := proc.Wait()
@@ -263,6 +326,7 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	// exactly one run:status event below.
 	//
 	// Trust order:
+	//   0. cancelRequested flag     → Cancelled (user-driven; not a failure, overrides everything below)
 	//   1. process exited non-zero  → Failed   (process crashed; ignore Python's intent)
 	//   2. gotError flag            → Failed   (Python called fail())
 	//   3. gotFailedStatus flag     → Failed   (Python sent Status(failed) without ErrorMsg)
@@ -369,14 +433,20 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	})
 }
 
-// CancelRun cancels a running script.
+// CancelRun cancels a running script. Returns ErrRunNotActive if the run
+// is not in activeRuns (already terminal, or never registered) — that
+// sentinel is filtered by CancelGroup so partial group cancels don't
+// produce spurious "did not cancel" toasts for siblings that already
+// completed or errored organically.
 func (m *Manager) CancelRun(runID string) error {
-	m.mu.RLock()
+	m.mu.Lock()
 	state, ok := m.activeRuns[runID]
-	m.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("run %s not found", runID)
+		m.mu.Unlock()
+		return ErrRunNotActive
 	}
+	state.cancelRequested = true
+	m.mu.Unlock()
 
 	// Try to send cancel via gRPC first. If it fails, kill immediately.
 	// If it succeeds, give the script a grace window to exit cleanly.

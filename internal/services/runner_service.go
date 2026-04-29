@@ -251,20 +251,29 @@ func (s *RunnerService) CancelGroup(groupID string) error {
 
 	var errs []error
 	for _, id := range g.RunIDs {
-		if err := s.manager.CancelRun(id); err != nil {
-			wrapped := fmt.Errorf("cancel %s: %w", id, err)
-			s.reservoir.Report(notify.Event{
-				Severity:    notify.SeverityError,
-				Persistence: notify.PersistenceOneShot,
-				Source:      notify.SourceBackend,
-				Title:       "Cancel all: worker did not cancel",
-				Message:     wrapped.Error(),
-				RunID:       id,
-				ScriptID:    g.ScriptID,
-				Err:         wrapped,
-			})
-			errs = append(errs, wrapped)
+		err := s.manager.CancelRun(id)
+		if err == nil {
+			continue
 		}
+		// Sibling already terminal (organic failure or completion before
+		// cancel-all arrived). Not a cancel failure — there is nothing to
+		// cancel. Filter out so we don't fire a spurious "did not cancel"
+		// toast for a worker the user already saw fail (or complete).
+		if errors.Is(err, runner.ErrRunNotActive) {
+			continue
+		}
+		wrapped := fmt.Errorf("cancel %s: %w", id, err)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Cancel all: worker did not cancel",
+			Message:     wrapped.Error(),
+			RunID:       id,
+			ScriptID:    g.ScriptID,
+			Err:         wrapped,
+		})
+		errs = append(errs, wrapped)
 	}
 	return errors.Join(errs...)
 }
@@ -307,14 +316,27 @@ func (s *RunnerService) clearRunFromGroup(runID string) {
 }
 
 func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-chan runner.Message) {
-	for msg := range ch {
-		app := s.app.Load()
-		if app == nil {
-			continue
+	// Track the most recent ErrorMsg payload so the StatusFailed toast can
+	// surface the real error text (and traceback) instead of just restating
+	// the script ID. Python's runner.fail() always sends ErrorMsg before
+	// StatusMsg(failed) on the same stream, so by the time the StatusMsg
+	// case runs, lastErrMessage is populated. forwardMessages runs once per
+	// run, so function-local state suffices — no shared map.
+	// emit calls Wails Event.Emit if the app has been wired up. Reservoir
+	// reports happen unconditionally (orthodoxy: every event flows through
+	// one ingress), so a not-yet-ready or shut-down app never causes log
+	// loss — only frontend live-update loss, which the banner system
+	// already surfaces.
+	emit := func(event string, payload any) {
+		if app := s.app.Load(); app != nil {
+			app.Event.Emit(event, payload)
 		}
+	}
+	var lastErrMessage, lastErrTraceback string
+	for msg := range ch {
 		switch m := msg.(type) {
 		case runner.OutputMsg:
-			app.Event.Emit("run:output", map[string]string{
+			emit("run:output", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -329,7 +351,7 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				ScriptID:    scriptID,
 			})
 		case runner.ProgressMsg:
-			app.Event.Emit("run:progress", map[string]any{
+			emit("run:progress", map[string]any{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -338,7 +360,7 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				"label":    m.Label,
 			})
 		case runner.StatusMsg:
-			app.Event.Emit("run:status", map[string]string{
+			emit("run:status", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -348,13 +370,22 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 			// silently. Manager is the authoritative source of terminal state
 			// (see manager.waitForExit), but we only learn the scriptID here,
 			// so the toast originates at this layer.
+			//
+			// StatusCancelled never enters this branch — cancel is not a
+			// failure surface. Frontend reflects the new state via the
+			// run:status event above and renders a cancelled badge.
 			if m.State == runner.StatusFailed {
+				body := lastErrMessage
+				if body == "" {
+					body = "Script reported failed status without an error message — see Logs for details."
+				}
 				s.reservoir.Report(notify.Event{
 					Severity:    notify.SeverityError,
 					Persistence: notify.PersistenceOneShot,
 					Source:      notify.SourceBackend,
 					Title:       "Run failed",
-					Message:     fmt.Sprintf("%s failed", scriptID),
+					Message:     body,
+					Traceback:   lastErrTraceback,
 					RunID:       runID,
 					ScriptID:    scriptID,
 				})
@@ -363,19 +394,39 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				s.clearRunFromGroup(runID)
 			}
 		case runner.ErrorMsg:
-			// In-flight error: routes to the per-run pane (run:error) and
-			// also writes a slog.Error record for the LogViewer / log file.
+			// In-flight error from Python. Default routing: per-run pane
+			// (run:error) + slog. For runs the user explicitly cancelled,
+			// Python's cooperative-cancel path emits fail("Cancelled by
+			// user") which arrives here as an ErrorMsg — demote to log-only
+			// (Info+OneShot per the routing matrix) so the cancel doesn't
+			// surface as an error pane, but slog still records it. Sibling
+			// runs are untouched: WasCancelled is per-runID, so a worker
+			// erroring organically while another is cancelled still routes
+			// through PersistenceInFlight as before.
+			sev := severityFromProto(m.Severity)
+			persist := notify.PersistenceInFlight
+			if s.manager.WasCancelled(runID) {
+				sev = notify.SeverityInfo
+				persist = notify.PersistenceOneShot
+			}
 			s.reservoir.Report(notify.Event{
-				Severity:    severityFromProto(m.Severity),
-				Persistence: notify.PersistenceInFlight,
+				Severity:    sev,
+				Persistence: persist,
 				Source:      notify.SourcePython,
 				Message:     m.Message,
 				RunID:       runID,
 				ScriptID:    scriptID,
 				Traceback:   m.Traceback,
 			})
+			// Capture for the StatusFailed toast (D1). Done unconditionally
+			// — even demoted errors set the body so a cancel/error race
+			// still produces a meaningful failure toast if the run later
+			// terminates as failed (which can't happen for a cancelled run,
+			// but the capture is harmless either way).
+			lastErrMessage = m.Message
+			lastErrTraceback = m.Traceback
 		case runner.DataMsg:
-			app.Event.Emit("run:data", map[string]any{
+			emit("run:data", map[string]any{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,

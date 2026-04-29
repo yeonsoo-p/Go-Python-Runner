@@ -12,7 +12,7 @@ export type { Script, Param, LoadIssue }
 // rest of the app keeps working.
 const LIVE_UPDATES_BROKEN_KEY = 'live-updates-broken'
 
-export type RunStatus = 'running' | 'completed' | 'failed'
+export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface RunState {
   runID: string

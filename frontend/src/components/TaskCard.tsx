@@ -30,6 +30,7 @@ function TaskCard({ script, runs, groups = [], onStartRun, onCancelRun, onCancel
   const statusColor = latestRun
     ? latestRun.status === 'completed' ? 'bg-green-500'
     : latestRun.status === 'failed' ? 'bg-red-500'
+    : latestRun.status === 'cancelled' ? 'bg-slate-500'
     : 'bg-yellow-500'
     : 'bg-slate-600'
 

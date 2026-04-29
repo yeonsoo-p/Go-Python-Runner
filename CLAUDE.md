@@ -370,6 +370,21 @@ Single source of truth across the four layers. Translation between layers is by 
 
 Source string (`'backend' \| 'python' \| 'frontend'`) is identical across all layers.
 
+### RunStatus reference
+
+Single source of truth across the four layers. Values are identical strings; the typed boundary is the gRPC handler converting the proto string into a typed `RunStatus` on the Go side.
+
+| Layer | RunStatus values |
+| --- | --- |
+| Proto (`runner.proto`) | `Status.state` is `string`; canonical: `"running" \| "completed" \| "failed" \| "cancelled"` |
+| Go (`internal/runner`) | `StatusRunning` / `StatusCompleted` / `StatusFailed` / `StatusCancelled` |
+| Python (`scripts/_lib/runner.py`) | `STATUS_RUNNING` / `STATUS_COMPLETED` / `STATUS_FAILED` / `STATUS_CANCELLED` |
+| TypeScript (`useScripts`) | `'running' \| 'completed' \| 'failed' \| 'cancelled'` |
+
+`IsTerminal()` (Go) and the equivalent frontend check (`status !== 'running'`) treat `completed / failed / cancelled` as terminal. Manager is the sole authority on terminal state — Python's `STATUS_*` constants exist for symmetry but Python only emits `completed` and `failed`; `cancelled` is set on the Go side when `CancelRun` was invoked (see `Manager.deriveFinalStatus` rule 0).
+
+**Cancellation primitives, by shape.** Run cancellation is a `RunStatus` value (state-machine terminal state). Dialog cancellation is a `bool` field on `FileDialogResponse` plus the `runner.ErrDialogCancelled` sentinel — a request/response outcome, not a state. The two primitives are intentionally different shapes; don't collapse them. The boundary-sentinel pattern (`ErrDialogCancelled`, `ErrRunNotActive`) is reusable for any future "expected non-completion" outcome.
+
 ## Python Script Structure
 
 Each script lives in `scripts/<name>/` with two files:

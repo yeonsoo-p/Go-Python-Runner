@@ -105,8 +105,11 @@ func TestErrorThenComplete(t *testing.T) {
 }
 
 // TestKillIgnoresCancel exercises the cancel grace + force-kill path: a script
-// that ignores SIGTERM is force-killed after the grace window, exits non-zero,
-// trust-order rule 1 → Failed.
+// that ignores SIGTERM is force-killed after the grace window. Even though the
+// kill produces a non-zero exit, trust-order rule 0 (cancelRequested) wins
+// and the run resolves to StatusCancelled — the user clicked cancel, that
+// intent overrides the kill mechanics. Pre-cancellation-as-status, this
+// asserted Failed (rule 1); the contract now expects Cancelled.
 func TestKillIgnoresCancel(t *testing.T) {
 	mgr, _, cleanup := testSetup(t)
 	defer cleanup()
@@ -159,7 +162,7 @@ collectLoop:
 	if !ok {
 		t.Fatal("no StatusMsg received")
 	}
-	if status != runner.StatusFailed {
-		t.Errorf("expected Failed (rule 1: force-kill exits non-zero), got %s", status)
+	if status != runner.StatusCancelled {
+		t.Errorf("expected Cancelled (rule 0: cancelRequested overrides force-kill exit), got %s", status)
 	}
 }
