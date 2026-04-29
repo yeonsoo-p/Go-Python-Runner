@@ -75,8 +75,12 @@ func NewEnvService(logger *slog.Logger) (*EnvService, error) {
 	}
 	// Best-effort version probe. Failures don't block service creation —
 	// the version is informational, not load-bearing.
-	if out, err := exec.Command(venv.Python, "--version").CombinedOutput(); err == nil {
-		info.PythonVersion = strings.TrimSpace(string(out))
+	{
+		probe := exec.Command(venv.Python, "--version")
+		runner.HideConsole(probe)
+		if out, err := probe.CombinedOutput(); err == nil {
+			info.PythonVersion = strings.TrimSpace(string(out))
+		}
 	}
 
 	logger.Info("env service initialized",
@@ -303,11 +307,17 @@ func (s *EnvService) forwardLines(r io.Reader, stream string) {
 }
 
 // command returns an *exec.Cmd, optionally constructed via the test hook.
+// Always suppresses the per-subprocess console window on Windows; the Wails
+// app is a -H windowsgui binary, so any flash console would be visible.
 func (s *EnvService) command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if s.commandHook != nil {
-		return s.commandHook(ctx, name, args...)
+		cmd = s.commandHook(ctx, name, args...)
+	} else {
+		cmd = exec.CommandContext(ctx, name, args...)
 	}
-	return exec.CommandContext(ctx, name, args...)
+	runner.HideConsole(cmd)
+	return cmd
 }
 
 // emit forwards a payload to the Wails frontend if the app is wired up.
