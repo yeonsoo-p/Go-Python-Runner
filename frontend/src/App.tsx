@@ -2,6 +2,8 @@ import { Component, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import TaskGrid from './components/TaskGrid'
 import LogViewer from './components/LogViewer'
+import NotificationStack from './components/NotificationStack'
+import { NotificationsProvider } from './hooks/useNotifications'
 
 class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -46,29 +48,36 @@ class ErrorBoundary extends Component<
 function App() {
   const [showLogs, setShowLogs] = useState(false)
 
+  // Tier guide (Frontend "shows", Go "manages"):
+  //   - Transient (action failed, app fine)        → toast via NotificationStack
+  //   - Persistent (feature broken, app usable)    → inline banner in the affected pane
+  //   - Catastrophic (app cannot function)         → ErrorBoundary fallback or loadError pane in TaskGrid
   return (
     <ErrorBoundary>
-      <div className="min-h-screen bg-slate-900 text-slate-200">
-        <header className="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
-          <h1 className="text-xl font-bold">Go Python Runner</h1>
-          <button
-            onClick={() => setShowLogs(!showLogs)}
-            className="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600 transition"
-          >
-            {showLogs ? 'Hide Logs' : 'Show Logs'}
-          </button>
-        </header>
+      <NotificationsProvider>
+        <div className="min-h-screen bg-slate-900 text-slate-200">
+          <header className="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
+            <h1 className="text-xl font-bold">Go Python Runner</h1>
+            <button
+              onClick={() => setShowLogs(!showLogs)}
+              className="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600 transition"
+            >
+              {showLogs ? 'Hide Logs' : 'Show Logs'}
+            </button>
+          </header>
 
-        <main className="p-6">
-          <TaskGrid />
-        </main>
+          <main className="p-6">
+            <TaskGrid />
+          </main>
 
-        {showLogs && (
-          <div className="border-t border-slate-700">
-            <LogViewer />
-          </div>
-        )}
-      </div>
+          {showLogs && (
+            <div className="border-t border-slate-700">
+              <LogViewer />
+            </div>
+          )}
+        </div>
+        <NotificationStack />
+      </NotificationsProvider>
     </ErrorBoundary>
   )
 }

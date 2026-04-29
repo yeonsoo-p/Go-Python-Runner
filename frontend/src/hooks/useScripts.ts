@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 
 // Import generated types from Wails bindings
 import type { Script, Param } from '../../bindings/go-python-runner/internal/registry/models'
+import { useNotifications } from './useNotifications'
 
 export type { Script, Param }
 
@@ -28,6 +29,8 @@ export function useScripts() {
   const [runs, setRuns] = useState<Map<string, RunState>>(new Map())
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [liveUpdatesAvailable, setLiveUpdatesAvailable] = useState(true)
+  const { addNotification } = useNotifications()
 
   useEffect(() => {
     async function load() {
@@ -39,6 +42,8 @@ export function useScripts() {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
+        // Catastrophic: app cannot function without scripts. Surface inline,
+        // not as a toast — user needs to see this prominently.
         setLoadError(`Failed to load scripts: ${msg}`)
         try {
           const svc = await import('../../bindings/go-python-runner/internal/services')
@@ -108,7 +113,10 @@ export function useScripts() {
         cleanup = [onOutput, onProgress, onStatus, onError, onData].map(unsub => () => unsub())
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
-        console.warn('Failed to set up events:', e)
+        // Persistent: live updates broken but the app can still launch scripts.
+        // Surface as an inline banner (via liveUpdatesAvailable flag), not a
+        // toast — the breakage is ongoing, not a single-event failure.
+        setLiveUpdatesAvailable(false)
         try {
           const svc = await import('../../bindings/go-python-runner/internal/services')
           svc.LogService?.LogError?.('frontend', `Failed to set up Wails event listeners: ${msg}`, {})
@@ -122,6 +130,19 @@ export function useScripts() {
       cleanup.forEach(fn => fn())
     }
   }, [])
+
+  // Transient action failures (StartRun / StartParallelRuns / CancelRun threw)
+  // are reported as toasts. The runs Map only ever contains real Manager-issued
+  // runIDs — the frontend no longer fabricates pseudo-IDs for failure-only display.
+  const reportTransient = useCallback((message: string, ctx: { scriptID?: string; runID?: string }) => {
+    addNotification({ level: 'error', message, scriptID: ctx.scriptID, runID: ctx.runID })
+    import('../../bindings/go-python-runner/internal/services')
+      .then(svc => svc.LogService?.LogError?.('frontend', message, {
+        ...(ctx.scriptID ? { scriptID: ctx.scriptID } : {}),
+        ...(ctx.runID ? { runID: ctx.runID } : {}),
+      }))
+      .catch(() => { /* bindings not available */ })
+  }, [addNotification])
 
   const startRun = useCallback(async (scriptID: string, params: Record<string, string>) => {
     try {
@@ -143,25 +164,10 @@ export function useScripts() {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      console.error('Failed to start run:', e)
-      // Report to backend logging
-      try {
-        const svc = await import('../../bindings/go-python-runner/internal/services')
-        svc.LogService?.LogError?.('frontend', `Failed to start run: ${msg}`, { scriptID })
-      } catch { /* bindings not available */ }
-      // Surface error in run state so UI can display it
-      const errorRunID = `error-${crypto.randomUUID()}`
-      setRuns(prev => {
-        const next = new Map(prev)
-        next.set(errorRunID, {
-          runID: errorRunID, scriptID, status: 'failed', output: [],
-          progress: null, error: { message: `Failed to start: ${msg}`, traceback: '' }, data: null,
-        })
-        return next
-      })
+      reportTransient(`Failed to start run: ${msg}`, { scriptID })
     }
     return null
-  }, [])
+  }, [reportTransient])
 
   const startParallelRuns = useCallback(async (scriptID: string, params: Record<string, string>, workerCount: number) => {
     try {
@@ -183,23 +189,10 @@ export function useScripts() {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      console.error('Failed to start parallel runs:', e)
-      try {
-        const svc = await import('../../bindings/go-python-runner/internal/services')
-        svc.LogService?.LogError?.('frontend', `Failed to start parallel runs: ${msg}`, { scriptID })
-      } catch { /* bindings not available */ }
-      const errorRunID = `error-${crypto.randomUUID()}`
-      setRuns(prev => {
-        const next = new Map(prev)
-        next.set(errorRunID, {
-          runID: errorRunID, scriptID, status: 'failed', output: [],
-          progress: null, error: { message: `Failed to start parallel runs: ${msg}`, traceback: '' }, data: null,
-        })
-        return next
-      })
+      reportTransient(`Failed to start parallel runs: ${msg}`, { scriptID })
     }
     return null
-  }, [])
+  }, [reportTransient])
 
   const cancelRun = useCallback(async (runID: string) => {
     try {
@@ -209,13 +202,9 @@ export function useScripts() {
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      console.error('Failed to cancel run:', e)
-      try {
-        const svc = await import('../../bindings/go-python-runner/internal/services')
-        svc.LogService?.LogError?.('frontend', `Failed to cancel run: ${msg}`, { runID })
-      } catch { /* bindings not available */ }
+      reportTransient(`Failed to cancel run: ${msg}`, { runID })
     }
-  }, [])
+  }, [reportTransient])
 
-  return { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun }
+  return { scripts, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun }
 }
