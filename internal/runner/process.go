@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -90,14 +91,19 @@ func (p *Process) Start() error {
 
 	// Read stderr in background. Close stderrDone after the reader has fully
 	// drained the pipe so Wait() can deterministically read p.stderr.
+	//
+	// "file already closed" / fs.ErrClosed is benign: when the process is killed
+	// (e.g. cancel-before-connect), the OS closes the pipe externally and our
+	// in-flight ReadAll observes that close. Any bytes already read are still in
+	// the buffer; suppress the error to avoid a noisy "stderr capture failed"
+	// log for an event that isn't a capture failure.
 	go func() {
 		defer close(p.stderrDone)
 		data, err := io.ReadAll(stderrPipe)
 		p.stderrMu.Lock()
-		if err != nil {
+		p.stderr.Write(data)
+		if err != nil && !errors.Is(err, os.ErrClosed) {
 			p.stderr.WriteString(fmt.Sprintf("[stderr capture failed: %v]", err))
-		} else {
-			p.stderr.Write(data)
 		}
 		p.stderrMu.Unlock()
 	}()
@@ -108,6 +114,10 @@ func (p *Process) Start() error {
 // Wait blocks until the process exits and returns the exit code and stderr output.
 func (p *Process) Wait() (exitCode int, stderrOutput string, err error) {
 	err = p.cmd.Wait()
+	// Cancel the context so Done() observers (e.g. waitAndSendStart waiting
+	// for Python to connect) can bail without burning the full connectTimeout.
+	// p.cancel is idempotent.
+	p.cancel()
 	// Wait for the stderr reader to finish draining the pipe before reading
 	// the buffer; cmd.Wait() returning does not by itself guarantee the reader
 	// has flushed.
@@ -125,9 +135,18 @@ func (p *Process) Wait() (exitCode int, stderrOutput string, err error) {
 	return 0, stderrOutput, nil
 }
 
-// Cancel terminates the process.
+// Cancel terminates the process. Safe to call multiple times; safe to call
+// after the process has already exited (no-op).
 func (p *Process) Cancel() {
 	p.cancel()
+}
+
+// Done returns a channel that is closed when the process exits, is cancelled,
+// or fails to start. Other goroutines (e.g. those waiting for the Python
+// client to connect via gRPC) can select on this to bail early instead of
+// waiting on a long timeout for an event that will never happen.
+func (p *Process) Done() <-chan struct{} {
+	return p.ctx.Done()
 }
 
 // FindPython locates the Python interpreter using the fallback order:

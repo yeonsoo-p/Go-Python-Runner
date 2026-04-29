@@ -164,9 +164,16 @@ const connectTimeout = 30 * time.Second
 const cancelGracePeriod = 3 * time.Second
 
 // waitAndSendStart waits for the Python script to connect, then sends start params.
+// Bails early if the process exits or is cancelled before connecting — otherwise
+// a cancelled-before-connect run would leak this goroutine for a full
+// connectTimeout (30s).
 func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc *Process) {
 	select {
 	case <-m.grpc.WaitConnected(runID):
+	case <-proc.Done():
+		// Process exited or was cancelled before Python connected.
+		// Nothing to send; waitForExit handles the cleanup path.
+		return
 	case <-time.After(connectTimeout):
 		m.logger.Error("timeout waiting for Python to connect, killing process", "runID", runID, "source", "backend")
 		proc.Cancel()

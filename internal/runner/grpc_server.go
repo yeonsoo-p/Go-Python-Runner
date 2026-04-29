@@ -184,11 +184,24 @@ func (s *GRPCServer) WaitConnected(runID string) <-chan struct{} {
 
 // WaitStreamDone blocks until the gRPC Execute() handler returns for the given run,
 // meaning all Python messages have been forwarded to the Messages channel.
+//
+// Short-circuits when the run never connected: streamDone is closed in
+// Execute()'s defer, so a Python that died before connecting would otherwise
+// burn the full timeout here for no reason. Callers invoke this from
+// waitForExit, AFTER proc.Wait() returned — by then the process is gone, so
+// "connected channel still open" reliably means "client never arrived."
 func (s *GRPCServer) WaitStreamDone(runID string, timeout time.Duration) {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
 	s.mu.RUnlock()
 	if !ok {
+		return
+	}
+	select {
+	case <-ch.connected:
+		// Client did connect — wait (with timeout) for the stream to fully drain.
+	default:
+		// Never connected; nothing to wait for.
 		return
 	}
 	select {
@@ -285,6 +298,11 @@ func (ch *RunChannel) streamSend(msg *pb.ServerMessage) error {
 	return ch.stream.Send(msg)
 }
 
+// handleClientMessage dispatches a ClientMessage from a Python client to the
+// appropriate handler. Assumes wire-deserialized input — protobuf unmarshaling
+// always materializes oneof sub-messages as non-nil (empty oneof payloads become
+// zero-valued structs, not nil pointers). In-process callers must uphold the
+// same invariant.
 func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.ClientMessage, stream pb.PythonRunner_ExecuteServer) error {
 	switch m := msg.Msg.(type) {
 	case *pb.ClientMessage_Output:

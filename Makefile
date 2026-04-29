@@ -1,4 +1,4 @@
-.PHONY: proto bindings codegen test test-go test-integration test-python test-frontend lint lint-go lint-python lint-frontend dev build bundle-python installer clean clean-generated
+.PHONY: proto bindings codegen test test-go test-integration test-stress test-python test-frontend lint lint-go lint-python lint-frontend dev build bundle-python installer clean clean-generated
 
 # --- Code Generation ---
 
@@ -25,10 +25,13 @@ codegen: proto bindings
 test: test-go test-python test-frontend test-integration
 
 test-go: codegen
-	go test ./internal/...
+	go test -race ./internal/...
 
 test-integration: codegen
-	go test ./tests/integration/ -tags=integration -v -timeout=120s
+	go test -race ./tests/integration/ -tags=integration -v -timeout=180s
+
+test-stress: codegen
+	go test -race -tags=stress -timeout=300s ./tests/stress/...
 
 test-python: codegen
 	uv run pytest scripts/_lib/tests/
