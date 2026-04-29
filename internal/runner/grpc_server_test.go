@@ -2,13 +2,12 @@ package runner
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"testing"
 	"time"
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
+	"go-python-runner/internal/notify"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -17,7 +16,6 @@ import (
 
 func testGRPCServer(t *testing.T) (*GRPCServer, func()) {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	cache := NewCacheManager()
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -26,7 +24,7 @@ func testGRPCServer(t *testing.T) (*GRPCServer, func()) {
 	if err := store.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewGRPCServer(cache, store, logger)
+	srv, err := NewGRPCServer(cache, store, &notify.RecordingReservoir{})
 	if err != nil {
 		t.Fatal(err)
 	}

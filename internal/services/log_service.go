@@ -1,27 +1,34 @@
 package services
 
 import (
-	"log/slog"
 	"sync/atomic"
 	"time"
 
 	"go-python-runner/internal/logging"
+	"go-python-runner/internal/notify"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// LogService is a Wails service that provides unified logging to the frontend.
+// LogService is a Wails service that exposes the unified log ring buffer to
+// the frontend and routes frontend-originated errors through the central
+// reservoir. Streamed log:entry events are how the LogViewer pane stays
+// real-time; that channel is independent of the notify:* surfaces, which
+// the reservoir handles directly.
 type LogService struct {
-	logger *slog.Logger
-	ring   *logging.RingBuffer
-	app    atomic.Pointer[application.App] // set after Wails init, read from goroutines
+	ring      *logging.RingBuffer
+	reservoir notify.Reservoir
+	app       atomic.Pointer[application.App] // set after Wails init, read from goroutines
 }
 
-// NewLogService creates a new LogService.
-func NewLogService(logger *slog.Logger, ring *logging.RingBuffer) *LogService {
+// NewLogService creates a new LogService. The reservoir is the sole
+// observability dependency; LogError forwards frontend errors through it
+// so they land in slog (and the ring buffer) plus the toast surface in
+// one call.
+func NewLogService(ring *logging.RingBuffer, reservoir notify.Reservoir) *LogService {
 	return &LogService{
-		logger: logger,
-		ring:   ring,
+		ring:      ring,
+		reservoir: reservoir,
 	}
 }
 
@@ -46,15 +53,25 @@ func (s *LogService) SetApp(app *application.App) {
 	})
 }
 
-// LogError receives error reports from the frontend.
+// LogError receives error reports from the frontend and routes them through
+// the reservoir so they reach slog (LogViewer + log file) and the toast
+// surface in one call. The optional context map becomes a flattened
+// "key=value, key=value" suffix on the message — the structured attrs
+// already capture source/runID/scriptID via the Event fields.
 func (s *LogService) LogError(source, message string, context map[string]string) {
-	attrs := []any{
-		"source", source,
-	}
-	for k, v := range context {
-		attrs = append(attrs, k, v)
-	}
-	s.logger.Error(message, attrs...)
+	runID := context["runID"]
+	scriptID := context["scriptID"]
+	traceback := context["traceback"]
+
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityError,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.Source(source),
+		Message:     message,
+		RunID:       runID,
+		ScriptID:    scriptID,
+		Traceback:   traceback,
+	})
 }
 
 // GetLogs returns all log entries from the ring buffer.

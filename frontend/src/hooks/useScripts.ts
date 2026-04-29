@@ -6,6 +6,12 @@ import { useNotifications } from './useNotifications'
 
 export type { Script, Param, LoadIssue }
 
+// Banner key for the "live updates broken" condition. Frontend-originated
+// ongoing banner: dispatched when Wails event setup fails so the user knows
+// real-time output / progress / status events won't update — even though the
+// rest of the app keeps working.
+const LIVE_UPDATES_BROKEN_KEY = 'live-updates-broken'
+
 export type RunStatus = 'running' | 'completed' | 'failed'
 
 export interface RunState {
@@ -26,25 +32,20 @@ interface DataEvent { runID: string; scriptID: string; key: string; value: strin
 
 export function useScripts() {
   const [scripts, setScripts] = useState<Script[]>([])
-  const [issues, setIssues] = useState<LoadIssue[]>([])
   const [runs, setRuns] = useState<Map<string, RunState>>(new Map())
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [liveUpdatesAvailable, setLiveUpdatesAvailable] = useState(true)
   const { addNotification } = useNotifications()
 
-  // loadCatalog fetches both scripts and issues. Called once on mount and
-  // again whenever the backend emits scripts:changed (filesystem watcher
-  // detected an add/remove/edit).
+  // loadCatalog fetches scripts only. Plugin LoadIssues no longer flow
+  // through this polling read — they arrive as ongoing banners on the
+  // notify:banners:list channel and render through the central notification
+  // stack.
   const loadCatalog = useCallback(async () => {
     try {
       const bindings = await import('../../bindings/go-python-runner/internal/services')
-      const [nextScripts, nextIssues] = await Promise.all([
-        bindings.ScriptService?.ListScripts?.() ?? Promise.resolve([]),
-        bindings.ScriptService?.ListIssues?.() ?? Promise.resolve([]),
-      ])
+      const nextScripts = await (bindings.ScriptService?.ListScripts?.() ?? Promise.resolve([]))
       setScripts(nextScripts || [])
-      setIssues(nextIssues || [])
       setLoadError(null)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -144,9 +145,16 @@ export function useScripts() {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         // Persistent: live updates broken but the app can still launch scripts.
-        // Surface as an inline banner (via liveUpdatesAvailable flag), not a
-        // toast — the breakage is ongoing, not a single-event failure.
-        setLiveUpdatesAvailable(false)
+        // Dispatched as an ongoing banner with a stable key so the central
+        // notification stack handles it like any other persistent condition.
+        addNotification({
+          severity: 'warn',
+          persistence: 'ongoing',
+          source: 'frontend',
+          key: LIVE_UPDATES_BROKEN_KEY,
+          title: 'Live updates unavailable',
+          message: `Script output may not refresh in real time: ${msg}`,
+        })
         try {
           const svc = await import('../../bindings/go-python-runner/internal/services')
           svc.LogService?.LogError?.('frontend', `Failed to set up Wails event listeners: ${msg}`, {})
@@ -159,13 +167,13 @@ export function useScripts() {
       aborted = true
       cleanup.forEach(fn => fn())
     }
-  }, [])
+  }, [addNotification])
 
   // Transient action failures (StartRun / StartParallelRuns / CancelRun threw)
   // are reported as toasts. The runs Map only ever contains real Manager-issued
   // runIDs — the frontend no longer fabricates pseudo-IDs for failure-only display.
   const reportTransient = useCallback((message: string, ctx: { scriptID?: string; runID?: string }) => {
-    addNotification({ level: 'error', message, scriptID: ctx.scriptID, runID: ctx.runID })
+    addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message, scriptID: ctx.scriptID, runID: ctx.runID })
     import('../../bindings/go-python-runner/internal/services')
       .then(svc => svc.LogService?.LogError?.('frontend', message, {
         ...(ctx.scriptID ? { scriptID: ctx.scriptID } : {}),
@@ -236,5 +244,5 @@ export function useScripts() {
     }
   }, [reportTransient])
 
-  return { scripts, issues, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun }
+  return { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun }
 }

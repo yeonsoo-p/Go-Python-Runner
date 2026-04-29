@@ -1,15 +1,13 @@
 package registry
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"go-python-runner/internal/notify"
 )
 
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-}
 
 func writeScript(t *testing.T, dir, id, name string) {
 	t.Helper()
@@ -31,7 +29,7 @@ func TestLoadBuiltin(t *testing.T) {
 	writeScript(t, dir, "hello", "Hello")
 	writeScript(t, dir, "data", "Data Processor")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +61,7 @@ func TestLoadBuiltin_SkipsLib(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +84,7 @@ func TestLoadBuiltin_SkipsMalformed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +108,7 @@ func TestLoadBuiltin_SkipsMissingMainPy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +125,7 @@ func TestPluginOverride(t *testing.T) {
 	writeScript(t, builtinDir, "hello", "Hello Builtin")
 	writeScript(t, pluginDir, "hello", "Hello Plugin")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(builtinDir); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +152,7 @@ func TestPluginAddsNew(t *testing.T) {
 	writeScript(t, builtinDir, "hello", "Hello")
 	writeScript(t, pluginDir, "custom", "Custom Plugin")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(builtinDir); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +174,7 @@ func TestPluginAddsNew(t *testing.T) {
 }
 
 func TestPluginDir_Nonexistent(t *testing.T) {
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	// Loading a nonexistent plugin dir should not error
 	if err := reg.LoadPlugins("/nonexistent/path"); err != nil {
 		t.Fatalf("expected no error for nonexistent plugin dir, got %v", err)
@@ -199,7 +197,7 @@ func TestLoadBuiltin_SkipsMissingID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +213,7 @@ func TestRegistry_Reload_DetectsChanges(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, dir, "alpha", "Alpha")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +244,7 @@ func TestRegistry_Reload_Idempotent(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, dir, "alpha", "Alpha")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +267,7 @@ func TestRegistry_Reload_DetectsRemovedScript(t *testing.T) {
 	writeScript(t, dir, "alpha", "Alpha")
 	writeScript(t, dir, "beta", "Beta")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +297,7 @@ func TestRegistry_Reload_AtomicityOnError(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, dir, "alpha", "Alpha")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +332,7 @@ func TestRegistry_Issues_PopulatedForMalformed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +368,7 @@ func TestRegistry_Issues_ClearedAfterFix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +409,7 @@ func TestRegistry_ConcurrentReadsDuringReload(t *testing.T) {
 		writeScript(t, dir, "s"+string(rune('a'+i)), "Script "+string(rune('A'+i)))
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +461,7 @@ func TestLoadBuiltin_MixedValidAndInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}

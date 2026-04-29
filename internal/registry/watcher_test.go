@@ -7,13 +7,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go-python-runner/internal/notify"
 )
 
 // startWatcher launches a Watcher with a short debounce in a goroutine and
 // returns a cancel func and a counter of onChange invocations.
 func startWatcher(t *testing.T, builtinDir, pluginDir string) (context.CancelFunc, *atomic.Int32, *Registry) {
 	t.Helper()
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if builtinDir != "" {
 		if err := reg.LoadBuiltin(builtinDir); err != nil {
 			t.Fatal(err)
@@ -28,7 +30,7 @@ func startWatcher(t *testing.T, builtinDir, pluginDir string) (context.CancelFun
 	var changes atomic.Int32
 	w := NewWatcher(reg, builtinDir, pluginDir, func() {
 		changes.Add(1)
-	}, testLogger())
+	}, &notify.RecordingReservoir{})
 	w.SetDebounce(50 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,12 +159,12 @@ func TestWatcher_StopsOnContextCancel(t *testing.T) {
 	dir := t.TempDir()
 	writeScript(t, dir, "alpha", "Alpha")
 
-	reg := New(testLogger())
+	reg := New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	w := NewWatcher(reg, dir, "", func() {}, testLogger())
+	w := NewWatcher(reg, dir, "", func() {}, &notify.RecordingReservoir{})
 	w.SetDebounce(20 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -186,8 +188,8 @@ func TestWatcher_PluginDirCreatedAtRunStart(t *testing.T) {
 	parent := t.TempDir()
 	pluginDir := filepath.Join(parent, "not-yet-existing", "plugins")
 
-	reg := New(testLogger())
-	w := NewWatcher(reg, "", pluginDir, func() {}, testLogger())
+	reg := New(&notify.RecordingReservoir{})
+	w := NewWatcher(reg, "", pluginDir, func() {}, &notify.RecordingReservoir{})
 	w.SetDebounce(20 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())

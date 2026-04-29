@@ -37,6 +37,15 @@ STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 
+# Severity constants — must match proto runner.Severity enum values and Go
+# notify.Severity ordering. Used by fail()/error()/warn()/info() to classify
+# Error-message notifications for the central reservoir.
+SEVERITY_UNSPECIFIED = 0
+SEVERITY_INFO = 1
+SEVERITY_WARN = 2
+SEVERITY_ERROR = 3
+SEVERITY_CRITICAL = 4
+
 # Module-level state
 _stub: Any = None
 _stream: Any = None
@@ -213,8 +222,8 @@ def complete() -> None:
     _finish()
 
 
-def fail(message: str, tb: str | None = None) -> None:
-    """Send an error and failed status to Go.
+def fail(message: str, tb: str | None = None, *, severity: int = SEVERITY_ERROR) -> None:
+    """Send an error and failed status to Go, terminating the run.
 
     When called without an explicit ``tb`` outside an ``except`` block,
     ``traceback.format_exc()`` returns the literal string ``"NoneType: None\\n"``
@@ -222,13 +231,55 @@ def fail(message: str, tb: str | None = None) -> None:
     occurred. Treat that as "no traceback available" so Go logs and the
     LogViewer don't display the noise. Validation-style ``fail("bad input")``
     calls now produce an empty traceback, which is the truth.
+
+    The ``severity`` defaults to SEVERITY_ERROR. Pass SEVERITY_CRITICAL for
+    failures that should surface as a full-screen catastrophic pane on the
+    frontend (e.g. unrecoverable resource exhaustion).
     """
     if tb is None:
         captured = traceback.format_exc()
         tb = "" if captured.strip() == "NoneType: None" else captured
-    _send(runner_pb2.ClientMessage(error=runner_pb2.Error(message=str(message), traceback=str(tb))), _force=True)
+    _send(
+        runner_pb2.ClientMessage(
+            error=runner_pb2.Error(
+                message=str(message),
+                traceback=str(tb),
+                severity=severity,
+            )
+        ),
+        _force=True,
+    )
     _send(runner_pb2.ClientMessage(status=runner_pb2.Status(state=STATUS_FAILED)), _force=True)
     _finish()
+
+
+def warn(message: str) -> None:
+    """Emit a structured warning notification to Go without terminating the run.
+
+    The Go reservoir routes this to slog.Warn + the LogViewer. Use for
+    recoverable issues the user/operator should know about but that don't
+    invalidate the run's results (e.g. "row 7 had a malformed value, skipped").
+    """
+    _send(
+        runner_pb2.ClientMessage(
+            error=runner_pb2.Error(message=str(message), severity=SEVERITY_WARN)
+        )
+    )
+
+
+def info(message: str) -> None:
+    """Emit a structured informational notification to Go.
+
+    Distinct from ``output()``: ``output()`` is part of the script's user-facing
+    text stream rendered in the run pane; ``info()`` is metadata for the
+    LogViewer / log file (e.g. "loaded 12 rows from cache"). Use ``output()``
+    for results, ``info()`` for trace.
+    """
+    _send(
+        runner_pb2.ClientMessage(
+            error=runner_pb2.Error(message=str(message), severity=SEVERITY_INFO)
+        )
+    )
 
 
 def _finish() -> None:

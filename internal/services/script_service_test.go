@@ -2,17 +2,13 @@ package services
 
 import (
 	"errors"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 )
-
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-}
 
 func writeTestScript(t *testing.T, dir, id, name string) {
 	t.Helper()
@@ -34,12 +30,13 @@ func TestScriptService_ListScripts(t *testing.T) {
 	writeTestScript(t, dir, "hello", "Hello")
 	writeTestScript(t, dir, "data", "Data Processor")
 
-	reg := registry.New(testLogger())
+	rec := &notify.RecordingReservoir{}
+	reg := registry.New(rec)
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	svc := NewScriptService(reg, testLogger(), dir)
+	svc := NewScriptService(reg, rec, dir)
 	scripts := svc.ListScripts()
 	if len(scripts) != 2 {
 		t.Fatalf("expected 2 scripts, got %d", len(scripts))
@@ -54,12 +51,13 @@ func TestScriptService_ListScripts_DeterministicOrder(t *testing.T) {
 	writeTestScript(t, dir, "alpha", "Alpha")
 	writeTestScript(t, dir, "mu", "Mu")
 
-	reg := registry.New(testLogger())
+	rec := &notify.RecordingReservoir{}
+	reg := registry.New(rec)
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	svc := NewScriptService(reg, testLogger(), dir)
+	svc := NewScriptService(reg, rec, dir)
 	first := svc.ListScripts()
 	second := svc.ListScripts()
 	for i := range first {
@@ -89,12 +87,13 @@ func TestScriptService_ListIssues_RoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := registry.New(testLogger())
+	rec := &notify.RecordingReservoir{}
+	reg := registry.New(rec)
 	if err := reg.LoadBuiltin(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	svc := NewScriptService(reg, testLogger(), dir)
+	svc := NewScriptService(reg, rec, dir)
 	issues := svc.ListIssues()
 	if len(issues) != 1 {
 		t.Fatalf("expected 1 issue, got %d", len(issues))
@@ -117,12 +116,18 @@ func (s *openSpy) open(path string) error {
 }
 
 func newSvcWithOpenSpy(t *testing.T, allowedRoot string) (*ScriptService, *openSpy) {
+	svc, spy, _ := newSvcWithOpenSpyAndReservoir(t, allowedRoot)
+	return svc, spy
+}
+
+func newSvcWithOpenSpyAndReservoir(t *testing.T, allowedRoot string) (*ScriptService, *openSpy, *notify.RecordingReservoir) {
 	t.Helper()
-	reg := registry.New(testLogger())
-	svc := NewScriptService(reg, testLogger(), allowedRoot)
+	rec := &notify.RecordingReservoir{}
+	reg := registry.New(rec)
+	svc := NewScriptService(reg, rec, allowedRoot)
 	spy := &openSpy{}
 	svc.openHook = spy.open
-	return svc, spy
+	return svc, spy, rec
 }
 
 // TestScriptService_OpenPath_Allowed_File verifies a file under the allowed
@@ -162,7 +167,10 @@ func TestScriptService_OpenPath_Allowed_Directory(t *testing.T) {
 }
 
 // TestScriptService_OpenPath_RejectsOutsidePath verifies path-allowlist
-// validation. The hook must NOT be called.
+// validation. The hook must NOT be called. This test demonstrates the
+// four-part error contract: error returned + reservoir reported (slog
+// follows automatically inside notify.Reservoir) + no torn state (hook
+// never called).
 func TestScriptService_OpenPath_RejectsOutsidePath(t *testing.T) {
 	allowed := t.TempDir()
 	outside := t.TempDir() // separate temp dir
@@ -171,7 +179,7 @@ func TestScriptService_OpenPath_RejectsOutsidePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc, spy := newSvcWithOpenSpy(t, allowed)
+	svc, spy, rec := newSvcWithOpenSpyAndReservoir(t, allowed)
 	err := svc.OpenPath(target)
 	if err == nil {
 		t.Fatal("expected error for path outside allowed roots")
@@ -179,6 +187,12 @@ func TestScriptService_OpenPath_RejectsOutsidePath(t *testing.T) {
 	if len(spy.calls) != 0 {
 		t.Errorf("hook should not have been called for rejected path, got %d calls", len(spy.calls))
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "outside allowed roots",
+	})
 }
 
 // TestScriptService_OpenPath_RejectsNonexistent verifies missing-file rejection.
@@ -225,8 +239,9 @@ func TestScriptService_OpenPath_NoAllowedRoots_RejectsEverything(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := registry.New(testLogger())
-	svc := NewScriptService(reg, testLogger()) // no allowed roots
+	rec := &notify.RecordingReservoir{}
+	reg := registry.New(rec)
+	svc := NewScriptService(reg, rec) // no allowed roots
 	if err := svc.OpenPath(target); err == nil {
 		t.Errorf("expected fail-closed (rejection) when no allowed roots configured")
 	}

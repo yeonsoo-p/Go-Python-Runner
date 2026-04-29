@@ -1,11 +1,9 @@
-import { useCallback, useState } from 'react'
+import { useCallback } from 'react'
 import { useScripts } from '../hooks/useScripts'
 import TaskCard from './TaskCard'
-import LoadIssuesBanner from './LoadIssuesBanner'
 
 function TaskGrid() {
-  const { scripts, issues, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun } = useScripts()
-  const [issuesExpanded, setIssuesExpanded] = useState(false)
+  const { scripts, runs, loading, loadError, startRun, startParallelRuns, cancelRun } = useScripts()
 
   const handleStartRun = useCallback(async (scriptID: string, params: Record<string, string>, workerCount?: number) => {
     if (workerCount && workerCount > 1) {
@@ -33,22 +31,11 @@ function TaskGrid() {
     )
   }
 
+  // Plugin LoadIssues and the live-updates-broken condition both render
+  // through the central NotificationStack as ongoing banners now — no
+  // hand-rolled banner state lives here.
   return (
     <div className="space-y-4">
-      {/* Persistent tier: live updates broken, app still usable. */}
-      {!liveUpdatesAvailable && (
-        <div className="rounded border border-yellow-700 bg-yellow-900/40 px-4 py-2 text-sm text-yellow-100">
-          Live updates unavailable. Script output may not refresh in real time — reload the app to retry.
-        </div>
-      )}
-      {/* Persistent tier: one or more plugin scripts failed to load. */}
-      {issues.length > 0 && (
-        <LoadIssuesBanner
-          issues={issues}
-          expanded={issuesExpanded}
-          onToggleExpanded={() => setIssuesExpanded(v => !v)}
-        />
-      )}
       {scripts.length === 0 ? (
         <div className="flex items-center justify-center h-64 text-slate-400">
           No scripts found.

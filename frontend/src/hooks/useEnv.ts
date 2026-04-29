@@ -62,7 +62,7 @@ export function useEnv() {
       setInfo(next ?? null)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ level: 'error', message: `Failed to load environment info: ${msg}` })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to load environment info: ${msg}` })
       setAvailable(false)
     }
   }, [addNotification])
@@ -75,7 +75,7 @@ export function useEnv() {
       setPackages(list ?? [])
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ level: 'error', message: `Failed to list packages: ${msg}` })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to list packages: ${msg}` })
     }
   }, [addNotification])
 
@@ -109,13 +109,11 @@ export function useEnv() {
             setLogLines(prev => [...prev, data])
           }
         })
-        const onEnd = Events.On('env:operation:end', (ev) => {
+        const onEnd = Events.On('env:operation:end', () => {
           setBusy(false)
-          const data = ev.data as { op?: string; spec?: string; error?: string } | undefined
-          if (data?.error) {
-            addNotification({ level: 'error', message: `${data.op ?? 'operation'} ${data.spec ?? ''} failed: ${data.error}` })
-          }
-          // Reload packages on every end so the table reflects new state.
+          // Errors flow through the central reservoir → notify:toast (handled
+          // by useNotifyChannel). env:operation:end is now a pure lifecycle
+          // signal; we just flip busy state and refresh the package list.
           void loadPackages()
         })
 
@@ -130,11 +128,11 @@ export function useEnv() {
       aborted = true
       cleanup.forEach(fn => fn())
     }
-  }, [addNotification, loadPackages])
+  }, [loadPackages])
 
   const installPackage = useCallback(async (spec: string) => {
     if (!spec.trim()) {
-      addNotification({ level: 'error', message: 'Package spec cannot be empty' })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Package spec cannot be empty' })
       return
     }
     try {
@@ -142,13 +140,13 @@ export function useEnv() {
       await bindings.EnvService.InstallPackage(spec, indexURL)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ level: 'error', message: `Install ${spec} failed: ${msg}` })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Install ${spec} failed: ${msg}` })
     }
   }, [addNotification, indexURL])
 
   const installRequirements = useCallback(async (absPath: string) => {
     if (!absPath.trim()) {
-      addNotification({ level: 'error', message: 'Requirements path cannot be empty' })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Requirements path cannot be empty' })
       return
     }
     try {
@@ -156,7 +154,7 @@ export function useEnv() {
       await bindings.EnvService.InstallRequirements(absPath, indexURL)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ level: 'error', message: `Install from ${absPath} failed: ${msg}` })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Install from ${absPath} failed: ${msg}` })
     }
   }, [addNotification, indexURL])
 
@@ -166,7 +164,7 @@ export function useEnv() {
       await bindings.EnvService.UninstallPackage(name)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      addNotification({ level: 'error', message: `Uninstall ${name} failed: ${msg}` })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Uninstall ${name} failed: ${msg}` })
     }
   }, [addNotification])
 

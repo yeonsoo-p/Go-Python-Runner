@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"go-python-runner/internal/notify"
+
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -86,7 +88,7 @@ func makeEnvService(t *testing.T, fakePython string, editable bool) (*EnvService
 			ToolName:   "pip",
 			Editable:   editable,
 		},
-		logger: testLogger(),
+		reservoir: &notify.RecordingReservoir{},
 	}
 	// Substitute a custom command hook for the rare test that needs it; by
 	// default just exec the fakePython binary directly.

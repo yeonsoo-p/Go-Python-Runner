@@ -17,7 +17,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 11. **Plugin system**: User-writable script directory that can override built-in scripts or add new ones post-build
 12. **Testing**: Three tiers — unit tests (isolated, fast), service tests (real deps, no full app), integration tests (end-to-end Go-Python)
 13. **Shared cache**: Parallel scripts share any Python object via `multiprocessing.shared_memory` + pickle. Go manages lifecycle (registry, ref counting, cleanup).
-14. **Error handling**: Every failure surfaces durably (slog) AND visibly (toast/banner/streamed pane). Hard rule, no exceptions. See § Error Handling for the four-part contract.
+14. **Error handling**: Every failure flows through one ingress — `internal/notify.Reservoir.Report(Event)` — which routes by severity × persistence to slog (file + ring buffer + LogViewer) AND a UI surface (toast, banner, streamed pane, or full-screen pane). Services hold *only* `notify.Reservoir`; `*slog.Logger` exists only in `main.go` and `internal/notify`. See § Error Handling for the four-part contract and the routing matrix.
 15. **Plugin authoring loop**: Catalog hot-reloads on filesystem changes via fsnotify; malformed plugins surface as `LoadIssue` records, not silent skips. Scripts can be opened in the OS default handler from the UI.
 
 ## Architecture Layers
@@ -26,17 +26,24 @@ A native desktop application that orchestrates bundled Python scripts through a 
 ┌──────────────────────────────────┐
 │  React Frontend (Task Cards)     │  Wails v3 webview
 │  - Auto-generated TS bindings    │
-│  - Wails events for real-time    │
+│  - useNotifyChannel subscribes   │
+│    to notify:* + run:* events    │
 ├──────────────────────────────────┤
 │  Go Backend (Wails Services)     │
 │  ├─ ScriptService (registry)     │  Wails bindings -> frontend
 │  ├─ RunnerService (lifecycle)    │  Wails events -> frontend
-│  ├─ LogService (unified logs)    │  All sources -> slog -> UI
+│  ├─ LogService (ring buffer +    │  GetLogs / log:entry events
+│  │   LogError shim into          │
+│  │   reservoir for frontend JS)  │
+│  ├─ EnvService (venv inspector)  │  Install/uninstall + streaming
+│  ├─ notify.Reservoir             │  *Single ingress* for every
+│  │                               │   error → slog + Wails routing
 │  └─ gRPC Server                  │  gRPC <-> Python
 ├──────────────────────────────────┤
 │  Python Scripts (bundled)        │
 │  - gRPC client (generated)       │
-│  - Helper library                │
+│  - Helper library (fail/warn/    │
+│    info carry Severity enum)     │
 └──────────────────────────────────┘
 ```
 
@@ -51,6 +58,10 @@ go-python-runner/
 ├── proto/
 │   └── runner.proto               # Protobuf service + message definitions
 ├── internal/
+│   ├── notify/                    # Central error reservoir (the single
+│   │   ├── notify.go               # ingress every error flows through;
+│   │   ├── notify_test.go          # owns severity × persistence routing
+│   │   └── testing.go              # to slog + Wails events)
 │   ├── services/
 │   │   ├── script_service.go      # Wails service: list/get scripts
 │   │   ├── script_service_test.go
@@ -205,8 +216,13 @@ Emits Wails events:
 - `run:output` — stdout text from script
 - `run:progress` — progress updates (current/total/label)
 - `run:status` — state transitions (running → completed | failed). Emitted exactly once at the terminal state by `Manager.waitForExit`. Python's `complete()` / `fail()` calls feed flags into Manager's derivation but do not produce frontend events on their own.
-- `run:error` — error messages with traceback (content; status is set by `run:status`)
+- `run:error` — error messages with traceback (content; status is set by `run:status`). Emitted by `notify.Reservoir` for in-flight errors (severity ≥ Error, has runID); routes to the per-run pane.
 - `run:data` — structured data results (key + value bytes from `data_result()`)
+- `notify:toast` — one-shot user-visible error/warn (auto-dismissing). Emitted by `notify.Reservoir` for `Severity:Error`/`Warn` × `Persistence:OneShot`.
+- `notify:banner` — sticky ongoing condition (e.g. plugin load issue). Emitted for `Persistence:Ongoing`. Banners dedupe by `Key`; same-key re-emission replaces the prior entry.
+- `notify:banner:dismiss` — Go signals a known ongoing condition cleared (paired with banner Key).
+- `notify:banners:list` — full banner snapshot, used for atomic replacement (`ReplaceBannersByPrefix`) and reconnect/refresh.
+- `notify:critical` — full-screen pane for unrecoverable failures (`Persistence:Catastrophic` or `Severity:Critical`).
 
 ## Go Concurrency Model
 
@@ -224,48 +240,43 @@ StartRun() ->  spawn Python subprocess
 
 ## Unified Logging
 
-Central structured logger in Go using `log/slog`. All three error sources funnel into one system.
+All three error sources funnel through one Go-side ingress: `notify.Reservoir.Report(Event)`. The reservoir owns the slog write AND the Wails routing decision — callers cannot pick "slog without UI" or "UI without slog" by accident.
 
 ```text
-┌─────────────┐     Wails binding      ┌──────────────────────┐
-│  Frontend    │ ──────────────────────>│                      │
-│  (React)     │  LogService.Error()    │   Go Central Logger  │
-└─────────────┘                        │   (log/slog)         │
-                                       │                      │──> Log file (rotating)
-┌─────────────┐     direct slog calls  │   Fields:            │──> In-memory ring buffer
-│  Go Backend  │ ──────────────────────>│   - source           │──> Wails events -> UI
-│  (services)  │                       │   - level            │
-└─────────────┘                        │   - runID            │
-                                       │   - scriptID         │
-┌─────────────┐     gRPC Error msg     │   - timestamp        │
-│  Python      │ ──────────────────────>│   - message          │
-│  Scripts     │     + stderr capture   │   - traceback        │
-└─────────────┘                        └──────────────────────┘
+┌─────────────┐     LogService.LogError()  ┌──────────────────────┐
+│  Frontend    │ ─────────────────────────>│                      │
+│  (React)     │     (thin shim → Report)  │   notify.Reservoir   │
+└─────────────┘                            │                      │
+                                           │   1. Always slog ──> File (lumberjack-rotated app.log)
+┌─────────────┐     reservoir.Report(...)  │              ──> Ring buffer (1000 entries)
+│  Go Backend  │ ─────────────────────────>│              ──> log:entry Wails event
+│  (services)  │                           │
+└─────────────┘                            │   2. Route by Severity × Persistence:
+                                           │      Error  + OneShot   → notify:toast
+┌─────────────┐     gRPC Error msg         │      Error  + Ongoing   → notify:banner
+│  Python      │ ─────────────────────────>│      Error  + InFlight  → run:error
+│  Scripts     │     + stderr capture      │      Critical/Catastrophic → notify:critical
+└─────────────┘                            │      Warn/Info + OneShot   → log-only
+                                           └──────────────────────┘
 ```
 
 ### Error sources
 
-| Source | How errors reach Go | Details |
+| Source | How errors reach the reservoir | Details |
 | --- | --- | --- |
-| Frontend (React) | `LogService.Error(msg, context)` Wails binding | JS errors, component errors, unhandled rejections. Frontend installs a global error handler that calls the binding. |
-| Go backend | Direct `slog` calls | Service errors, gRPC server errors, process lifecycle failures |
-| Python scripts | gRPC `Error` message (structured) + stderr capture (unstructured) | gRPC errors carry message + traceback. Stderr catches crashes before gRPC connects or after it disconnects. |
+| Frontend (React) | `LogService.LogError(source, msg, context)` Wails binding | Becomes a `Source:Frontend` event. ErrorBoundary + global handlers wired in `main.tsx` / `App.tsx` call into this. |
+| Go backend | `reservoir.Report(notify.Event{...})` directly | Services hold `notify.Reservoir` only — `*slog.Logger` is internal to the reservoir. |
+| Python scripts | gRPC `Error` message (structured) + stderr capture (unstructured) | gRPC errors carry `Severity` (proto enum) + traceback. Manager reservoir-reports stderr-synthesized errors when Python crashes pre-`fail()`. |
 
 ### LogService (Wails service)
 
-- `LogError(source string, message string, context map[string]string)` — frontend calls this to report JS errors
-- `GetLogs(filter LogFilter) []LogEntry` — UI fetches filtered log entries
-- Emits Wails event `log:entry` for real-time log streaming to the UI
+- `LogError(source, message, context)` — thin shim that calls `reservoir.Report(Severity:Error, Persistence:OneShot, Source:<arg>)`. The optional `runID` / `scriptID` / `traceback` keys in `context` carry through.
+- `GetLogs() []LogEntry` — returns ring buffer entries; client filters.
+- Emits Wails event `log:entry` for real-time log streaming.
 
 ### Log levels
 
-Using `slog` levels: DEBUG, INFO, WARN, ERROR.
-
-- Python output/progress messages = INFO
-- Python `Error` gRPC message = ERROR
-- Python stderr (crash output) = ERROR
-- Frontend JS errors = ERROR
-- Go service errors = ERROR
+`notify.Severity` (Info / Warn / Error / Critical) maps 1:1 to slog levels (Info / Warn / Error / Error). `Severity:Info` + `Persistence:OneShot` is the trace pattern — what used to be `slog.Info(...)` becomes `reservoir.Report(...)` with those values, which routes to log-only (no toast).
 
 ### Log output
 
@@ -289,58 +300,78 @@ Using `slog` levels: DEBUG, INFO, WARN, ERROR.
 For every operation that can fail:
 
 1. **Return the error.** Functions that can fail return `error` (Go) or reject the Promise (TS). Discarding with `_ =` or empty `catch {}` is forbidden.
-2. **Record durably.** Every error reaches `slog.Error(...)` exactly once, at the layer that owns the failure. LogViewer is the debugging archive — if it's not there, future-you can't investigate.
-3. **Surface to the user.** Every error reaches at least one user-visible surface chosen by the persistence × severity matrix below.
+2. **Record durably.** A single `reservoir.Report(Event)` call writes to slog (file + ring buffer + LogViewer) and emits the routed Wails event. The reservoir owns step 2 by construction; callers cannot record durably without surfacing.
+3. **Surface to the user.** Same `reservoir.Report` call — the routing matrix below picks the surface from `Severity × Persistence`. There is no second call.
 4. **Don't leave torn state.** If the failure happened mid-operation, recover or roll back before returning. Half-applied state is worse than a clean rollback.
+
+Parts 2 and 3 used to be two separate things to remember (slog + Wails Emit). They are now satisfied by a single `Report` call, which is why the orthodoxy is non-negotiable: services hold *only* `notify.Reservoir`, never a logger.
+
+### Orthodox dependency pattern (non-negotiable)
+
+1. **Reservoir is the sole observability dependency.** Every service that emits anything observable (error, warning, info trace) holds exactly one field: `reservoir notify.Reservoir`. No `*slog.Logger` field.
+2. **Trace events go through `reservoir.Report` too.** What used to be `s.logger.Info(...)` is now `s.reservoir.Report(notify.Event{Severity: SeverityInfo, Persistence: PersistenceOneShot, ...})`. The routing maps Info+OneShot to log-only — no UI noise.
+3. **Reservoir is constructor-only.** Every service takes `notify.Reservoir` as a constructor parameter. No `SetReservoir`, no two-phase init, no nil-tolerant fallback.
+4. **Banner publication uses `Reservoir.ReplaceBannersByPrefix` directly.** No per-service `publishIssues` wrapper. Whoever owns the keyspace (`loadIssue:*`, etc.) calls `ReplaceBannersByPrefix` itself.
+5. **`*slog.Logger` exists only in `main.go` and `internal/notify`.** Importing `log/slog` in a service breaks the rule.
 
 ### Three orthogonal axes (not a hierarchy)
 
-`LoadIssue`, returned errors, and `slog.Warn`/`slog.Error` are three different axes that *coordinate* but don't subsume each other:
-
 | Axis | Question it answers |
 | --- | --- |
-| **Severity** (info / warn / error) | *How bad?* |
-| **Persistence** (one-shot vs ongoing vs in-flight) | *Does the user need to take action that persists across renders?* |
-| **Surface** (log / toast / banner / streamed pane) | *Where does the user see it?* |
+| **Severity** (info / warn / error / critical) | *How bad?* |
+| **Persistence** (one-shot / ongoing / in-flight / catastrophic) | *Does the user need to take action that persists across renders?* |
+| **Source** (backend / python / frontend) | *Who reported it?* |
 
-Surface is **determined by** persistence × severity:
+Surface is **determined by** Severity × Persistence inside `notify.Reservoir.routeWails`:
 
-| Persistence | Severity | Surface |
-| --- | --- | --- |
-| Ongoing | error/warn | **Banner** + `slog.Warn`/`Error` to log |
-| One-shot | error | **Toast** + `slog.Error` to log |
-| One-shot | warn/info | `slog.Warn`/`Info` to log only (no toast — would be noisy) |
-| In-flight | varies | **Streamed log pane** + final toast on terminal error |
-| Catastrophic | error | **Full-screen retry pane** + `slog.Error` to log |
+| Persistence | Severity | Wails event | UI surface |
+| --- | --- | --- | --- |
+| Ongoing | warn / error | `notify:banner` (key-deduped) | Sticky banner |
+| One-shot | error | `notify:toast` | Auto-dismissing toast |
+| One-shot | warn / info | (none — log-only) | LogViewer only |
+| In-flight | error (with runID) | `run:error` | Per-run streamed pane |
+| In-flight | warn / info | `notify:toast` | Toast (so it isn't lost in a collapsed card) |
+| Catastrophic | any | `notify:critical` | Full-screen pane |
+| any | critical | `notify:critical` | Full-screen pane (severity overrides persistence) |
 
-A single logical event can produce records on multiple surfaces because they answer different questions. A malformed `script.json` produces a `LoadIssue` (banner row) AND a `slog.Warn` (durable record). A failed `InstallPackage` produces a toast (one-shot) AND streamed pip output (in-flight) AND a `slog.Error`. Don't pick one and skip the others.
+`ReplaceBannersByPrefix` additionally emits `notify:banners:list` with the full ongoing-banner snapshot — the frontend's central router (`useNotifyChannel`) atomically swaps its ongoing-banner set on each one.
 
 ### Forbidden patterns
 
 | Anti-pattern | Why forbidden |
 | --- | --- |
 | `_ = mgr.CancelRun(id)` | Discarded errors. If you genuinely don't care, comment why and use `//nolint:errcheck`. |
-| `slog.Error(...)` with no UI surface | Durable record without user signal — user retries thinking it didn't run. |
-| `addNotification({level:'error',...})` with no `slog.Error` | Toast vanishes in 5s; tomorrow's bug report has no trace. |
+| Holding `*slog.Logger` in a service | Violates the orthodoxy. Logger is internal to `notify.Reservoir`. |
+| `s.logger.Error(...)` then `app.Event.Emit("foo:error", ...)` | Two-call pattern; one of them will rot. Use a single `Report`. |
+| `addNotification({severity:'error', ...})` from a frontend path that has no Go-side log | Toast vanishes in 6s; tomorrow's bug report has no trace. Frontend errors should go through `LogService.LogError` (which routes through the reservoir). |
 | `try { ... } catch { return null }` | Silent swallow; downstream can't tell "no data" from "broken." |
-| Returning success with `slog.Warn("partial failure")` | If part failed, the operation failed. Period. |
+| Returning success with a `Severity:Warn` `Report` of "partial failure" | If part failed, the operation failed. Period. |
 | Default-to-fallback values on error | Hides failures. The caller can decide on a fallback if they want one. |
 
 ### Templates
 
-Wails-bound method:
+Wails-bound method (orthodox):
 
 ```go
 func (s *FooService) DoThing(arg string) error {
     if err := s.validate(arg); err != nil {
-        s.logger.Error("validate failed", "arg", arg, "error", err.Error(), "source", "backend")
-        return fmt.Errorf("validate %q: %w", arg, err)
+        wrapped := fmt.Errorf("validate %q: %w", arg, err)
+        s.reservoir.Report(notify.Event{
+            Severity:    notify.SeverityError,
+            Persistence: notify.PersistenceOneShot,
+            Source:      notify.SourceBackend,
+            Title:       "DoThing failed",
+            Message:     wrapped.Error(),
+            Err:         wrapped,
+        })
+        return wrapped
     }
-    if err := s.execute(arg); err != nil {
-        s.logger.Error("execute failed", "arg", arg, "error", err.Error(), "source", "backend")
-        return fmt.Errorf("execute %q: %w", arg, err)
-    }
-    s.logger.Info("doThing succeeded", "arg", arg, "source", "backend")
+    s.reservoir.Report(notify.Event{
+        Severity:    notify.SeverityInfo,
+        Persistence: notify.PersistenceOneShot,
+        Source:      notify.SourceBackend,
+        Message:     fmt.Sprintf("doThing succeeded: %s", arg),
+    })
     return nil
 }
 ```
@@ -352,8 +383,8 @@ try {
   await bindings.FooService.DoThing(arg)
 } catch (e) {
   const msg = e instanceof Error ? e.message : String(e)
-  addNotification({ level: 'error', message: `Failed to do thing: ${msg}` })
-  // Go already logged via slog; no need for LogService.LogError here.
+  addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: `Failed to do thing: ${msg}` })
+  // Go already reservoir.Report'd — no need for LogService.LogError here.
 }
 ```
 
@@ -362,14 +393,15 @@ Background goroutine:
 ```go
 go func() {
     if err := s.longRun(...); err != nil {
-        s.logger.Error("longRun failed", "error", err.Error(), "source", "backend")
-        if app := s.app.Load(); app != nil {
-            app.Event.Emit("foo:error", map[string]string{"message": err.Error()})
-        }
+        s.reservoir.Report(notify.Event{
+            Severity:    notify.SeverityError,
+            Persistence: notify.PersistenceOneShot,
+            Source:      notify.SourceBackend,
+            Title:       "longRun failed",
+            Message:     err.Error(),
+            Err:         err,
+        })
         return
-    }
-    if app := s.app.Load(); app != nil {
-        app.Event.Emit("foo:done", nil)
     }
 }()
 ```
@@ -381,30 +413,51 @@ When a primary operation fails and rollback fires, the rollback itself may parti
 ```go
 runIDs, primaryErr := s.startAll(...)
 if primaryErr != nil {
+    s.reservoir.Report(notify.Event{
+        Severity: notify.SeverityError, Persistence: notify.PersistenceOneShot,
+        Source: notify.SourceBackend, Title: "Parallel run failed",
+        Message: primaryErr.Error(), Err: primaryErr,
+    })
     var cleanup []error
     for _, id := range runIDs {
         if cancelErr := s.manager.CancelRun(id); cancelErr != nil {
-            s.logger.Error("rollback cancel failed", "runID", id, "error", cancelErr.Error(), "source", "backend")
-            cleanup = append(cleanup, fmt.Errorf("rollback %s: %w", id, cancelErr))
+            rollbackErr := fmt.Errorf("rollback %s: %w", id, cancelErr)
+            s.reservoir.Report(notify.Event{
+                Severity: notify.SeverityError, Persistence: notify.PersistenceOneShot,
+                Source: notify.SourceBackend, RunID: id,
+                Title: "Parallel rollback incomplete", Message: rollbackErr.Error(), Err: rollbackErr,
+            })
+            cleanup = append(cleanup, rollbackErr)
         }
     }
-    s.logger.Error("StartParallelRuns failed", "error", primaryErr.Error(), "source", "backend")
-    return nil, errors.Join(primaryErr, errors.Join(cleanup...))
+    return nil, errors.Join(append([]error{primaryErr}, cleanup...)...)
 }
 ```
 
-Every error is durably logged at its layer; the joined error becomes one toast on the frontend. No exemption, no carve-out.
+Every error is durably reported at its layer; the joined error becomes the binding's rejection on the frontend. No exemption, no carve-out.
 
 ### Tests must enforce
 
-Every new method gets at least one negative test asserting all four parts of the contract:
+Every new method gets at least one negative test asserting all four parts of the contract via `notify.AssertContract` (defined in `internal/notify/testing.go`):
 
 - Method returns a non-nil error when its dep fails.
-- `slog.Error` is captured (use a test `slog.Handler` that records entries — see `internal/services/log_service_test.go`).
-- The user-visible surface is reached (frontend test: mock the binding to throw, assert toast appears via `useNotifications`).
-- Internal state remains coherent.
+- A `notify.RecordingReservoir` recorded an `Event` with the expected `Severity`, `Persistence`, `Source` (Phase B already proves Report always slog-writes — no need to re-assert that per service).
+- Internal state remains coherent (active runs map, cache registry, registry issues — service-specific assertions).
 
-The four assertions are the four parts of the contract. If a test asserts only "method returned an error," it's incomplete.
+For tests that *also* need to verify the slog record itself (e.g. attribute round-trip), construct the reservoir as `notify.New(testLogger)` where `testLogger` wraps a capturing `slog.Handler` — see `internal/services/log_service_test.go::reservoirAndRing` for the pattern.
+
+### Severity & Persistence reference
+
+Single source of truth across the four layers. Translation between layers is by formatting alone.
+
+| Layer | Severity | Persistence |
+| --- | --- | --- |
+| Proto (`runner.proto`) | `SEVERITY_INFO` / `SEVERITY_WARN` / `SEVERITY_ERROR` / `SEVERITY_CRITICAL` (+ `SEVERITY_UNSPECIFIED` = ERROR for back-compat) | n/a (UI concept) |
+| Go (`internal/notify`) | `notify.SeverityInfo` / `SeverityWarn` / `SeverityError` / `SeverityCritical` | `notify.PersistenceOneShot` / `PersistenceOngoing` / `PersistenceInFlight` / `PersistenceCatastrophic` |
+| Python (`scripts/_lib/runner.py`) | `SEVERITY_INFO` / `SEVERITY_WARN` / `SEVERITY_ERROR` / `SEVERITY_CRITICAL` | n/a |
+| TypeScript (`useNotifications`) | `'info' \| 'warn' \| 'error' \| 'critical'` | `'one-shot' \| 'ongoing' \| 'in-flight' \| 'catastrophic'` |
+
+Source string (`'backend' \| 'python' \| 'frontend'`) is identical across all layers.
 
 ## Python Script Structure
 

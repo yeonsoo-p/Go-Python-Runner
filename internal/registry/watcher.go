@@ -3,11 +3,13 @@ package registry
 import (
 	"context"
 	"errors"
-	"log/slog"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"go-python-runner/internal/notify"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -27,19 +29,21 @@ type Watcher struct {
 	pluginDir  string
 	debounce   time.Duration
 	onChange   func()
-	logger     *slog.Logger
+	reservoir  notify.Reservoir
 }
 
 // NewWatcher constructs a Watcher. onChange must not be nil; pass a no-op if
 // you genuinely don't need to react to changes (the Reload still happens).
-func NewWatcher(reg *Registry, builtinDir, pluginDir string, onChange func(), logger *slog.Logger) *Watcher {
+// The reservoir is the sole observability dependency — fsnotify failures
+// and reload errors flow through reservoir.Report.
+func NewWatcher(reg *Registry, builtinDir, pluginDir string, onChange func(), reservoir notify.Reservoir) *Watcher {
 	return &Watcher{
 		reg:        reg,
 		builtinDir: builtinDir,
 		pluginDir:  pluginDir,
 		debounce:   DefaultDebounce,
 		onChange:   onChange,
-		logger:     logger,
+		reservoir:  reservoir,
 	}
 }
 
@@ -47,7 +51,8 @@ func NewWatcher(reg *Registry, builtinDir, pluginDir string, onChange func(), lo
 func (w *Watcher) SetDebounce(d time.Duration) { w.debounce = d }
 
 // Run blocks until ctx is cancelled. Returns the first fatal error from
-// fsnotify; per-event errors are logged and the loop continues.
+// fsnotify; per-event errors are surfaced via reservoir.Report and the loop
+// continues.
 func (w *Watcher) Run(ctx context.Context) error {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -58,18 +63,36 @@ func (w *Watcher) Run(ctx context.Context) error {
 	// Make sure the plugin dir exists so we can watch it. Idempotent.
 	if w.pluginDir != "" {
 		if mkErr := os.MkdirAll(w.pluginDir, 0o755); mkErr != nil {
-			w.logger.Warn("could not create plugin dir for watching",
-				"dir", w.pluginDir, "error", mkErr.Error(), "source", "backend")
+			w.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Plugin dir unavailable",
+				Message:     fmt.Sprintf("could not create plugin dir for watching: %s", w.pluginDir),
+				Err:         mkErr,
+			})
 		}
 	}
 
 	if err := w.addRecursive(fsw, w.builtinDir); err != nil {
-		w.logger.Warn("could not watch builtin scripts dir",
-			"dir", w.builtinDir, "error", err.Error(), "source", "backend")
+		w.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Builtin scripts dir unwatched",
+			Message:     fmt.Sprintf("could not watch builtin scripts dir: %s", w.builtinDir),
+			Err:         err,
+		})
 	}
 	if err := w.addRecursive(fsw, w.pluginDir); err != nil {
-		w.logger.Warn("could not watch plugin dir",
-			"dir", w.pluginDir, "error", err.Error(), "source", "backend")
+		w.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Plugin dir unwatched",
+			Message:     fmt.Sprintf("could not watch plugin dir: %s", w.pluginDir),
+			Err:         err,
+		})
 	}
 
 	var (
@@ -80,16 +103,23 @@ func (w *Watcher) Run(ctx context.Context) error {
 	fire := func() {
 		changed, reloadErr := w.reg.Reload(w.builtinDir, w.pluginDir)
 		if reloadErr != nil {
-			w.logger.Error("registry reload failed",
-				"error", reloadErr.Error(), "source", "backend")
+			w.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Registry reload failed",
+				Message:     reloadErr.Error(),
+				Err:         reloadErr,
+			})
 			return
 		}
 		if changed {
-			w.logger.Info("registry reloaded",
-				"scripts", len(w.reg.List()),
-				"issues", len(w.reg.Issues()),
-				"source", "backend",
-			)
+			w.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityInfo,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Message:     fmt.Sprintf("registry reloaded: %d scripts, %d issues", len(w.reg.List()), len(w.reg.Issues())),
+			})
 			if w.onChange != nil {
 				w.onChange()
 			}
@@ -122,8 +152,13 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if ev.Op&fsnotify.Create != 0 {
 				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
 					if addErr := fsw.Add(ev.Name); addErr != nil && !errors.Is(addErr, fsnotify.ErrEventOverflow) {
-						w.logger.Debug("could not watch newly created dir",
-							"dir", ev.Name, "error", addErr.Error(), "source", "backend")
+						// Per-dir watch failure is a deep-trace event; log-only via Info.
+						w.reservoir.Report(notify.Event{
+							Severity:    notify.SeverityInfo,
+							Persistence: notify.PersistenceOneShot,
+							Source:      notify.SourceBackend,
+							Message:     fmt.Sprintf("could not watch newly created dir %s: %s", ev.Name, addErr.Error()),
+						})
 					}
 				}
 			}
@@ -132,7 +167,14 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			w.logger.Warn("fsnotify error", "error", err.Error(), "source", "backend")
+			w.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "fsnotify error",
+				Message:     err.Error(),
+				Err:         err,
+			})
 		}
 	}
 }
@@ -158,8 +200,13 @@ func (w *Watcher) addRecursive(fsw *fsnotify.Watcher, dir string) error {
 			return filepath.SkipDir
 		}
 		if addErr := fsw.Add(path); addErr != nil {
-			w.logger.Debug("could not watch dir",
-				"dir", path, "error", addErr.Error(), "source", "backend")
+			// Per-dir watch failure is a deep-trace event; log-only via Info.
+			w.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityInfo,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Message:     fmt.Sprintf("could not watch dir %s: %s", path, addErr.Error()),
+			})
 		}
 		return nil
 	})

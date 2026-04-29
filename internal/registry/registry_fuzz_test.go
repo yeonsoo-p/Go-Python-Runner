@@ -1,16 +1,16 @@
 package registry
 
 import (
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"go-python-runner/internal/notify"
 )
 
 // FuzzLoadPlugins drives Registry.LoadPlugins with adversarial script.json
-// content to ensure malformed plugins are skipped (with a warning) rather
-// than panicking the host process.
+// content to ensure malformed plugins are skipped (with a banner report)
+// rather than panicking the host process.
 func FuzzLoadPlugins(f *testing.F) {
 	f.Add([]byte(`{"id":"x","name":"X","description":"","params":[]}`))
 	f.Add([]byte(`{"id":"y","name":"Y","description":"d","params":[{"name":"p","required":true,"default":"","description":""}]}`))
@@ -21,8 +21,6 @@ func FuzzLoadPlugins(f *testing.F) {
 	f.Add([]byte(`{"id":"x","params":[{"name":"\xff\xfe"}]}`))
 	f.Add([]byte(`{"id":"x","parallel":{"max_workers":-1,"vary_param":""}}`))
 	f.Add([]byte(`{"id":"` + string(make([]byte, 8192)) + `"}`))
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	f.Fuzz(func(t *testing.T, scriptJSON []byte) {
 		dir := t.TempDir()
@@ -37,7 +35,7 @@ func FuzzLoadPlugins(f *testing.F) {
 			t.Fatal(err)
 		}
 
-		reg := New(logger)
+		reg := New(&notify.RecordingReservoir{})
 		// Must not panic regardless of input. Errors are acceptable; panics aren't.
 		_ = reg.LoadPlugins(dir)
 	})

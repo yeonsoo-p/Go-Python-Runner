@@ -28,33 +28,34 @@ describe('useNotifications', () => {
 
     let id = ''
     act(() => {
-      id = result.current.addNotification({ level: 'error', message: 'boom' })
+      id = result.current.addNotification({ severity: 'error', persistence: 'one-shot', message: 'boom' })
     })
     expect(result.current.notifications).toHaveLength(1)
     expect(result.current.notifications[0].id).toBe(id)
-    expect(result.current.notifications[0].level).toBe('error')
+    expect(result.current.notifications[0].severity).toBe('error')
+    expect(result.current.notifications[0].persistence).toBe('one-shot')
     expect(result.current.notifications[0].message).toBe('boom')
   })
 
-  it('auto-dismisses after autoDismissMs elapses', () => {
+  it('one-shot notifications auto-dismiss after the default 6s window', () => {
     const { result } = renderHook(() => useNotifications(), { wrapper })
 
     act(() => {
-      result.current.addNotification({ level: 'info', message: 'temp', autoDismissMs: 1000 })
+      result.current.addNotification({ severity: 'info', persistence: 'one-shot', message: 'temp' })
     })
     expect(result.current.notifications).toHaveLength(1)
 
     act(() => {
-      vi.advanceTimersByTime(1000)
+      vi.advanceTimersByTime(6000)
     })
     expect(result.current.notifications).toHaveLength(0)
   })
 
-  it('does not auto-dismiss when autoDismissMs is 0', () => {
+  it('ongoing banners do not auto-dismiss', () => {
     const { result } = renderHook(() => useNotifications(), { wrapper })
 
     act(() => {
-      result.current.addNotification({ level: 'error', message: 'sticky', autoDismissMs: 0 })
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'sticky', key: 'load:foo' })
     })
 
     act(() => {
@@ -63,14 +64,75 @@ describe('useNotifications', () => {
     expect(result.current.notifications).toHaveLength(1)
   })
 
+  it('ongoing banners with the same key dedupe', () => {
+    const { result } = renderHook(() => useNotifications(), { wrapper })
+
+    act(() => {
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'first', key: 'load:foo' })
+      result.current.addNotification({ severity: 'error', persistence: 'ongoing', message: 'second', key: 'load:foo' })
+    })
+
+    expect(result.current.notifications).toHaveLength(1)
+    expect(result.current.notifications[0].message).toBe('second')
+    expect(result.current.notifications[0].severity).toBe('error')
+  })
+
+  it('in-flight notifications are dropped from the global stack', () => {
+    const { result } = renderHook(() => useNotifications(), { wrapper })
+
+    act(() => {
+      result.current.addNotification({ severity: 'error', persistence: 'in-flight', message: 'streamed', runID: 'r1' })
+    })
+    expect(result.current.notifications).toHaveLength(0)
+  })
+
+  it('dismissByKey clears every ongoing entry with the given key', () => {
+    const { result } = renderHook(() => useNotifications(), { wrapper })
+
+    act(() => {
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'a', key: 'load:foo' })
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'b', key: 'load:bar' })
+    })
+    expect(result.current.notifications).toHaveLength(2)
+
+    act(() => {
+      result.current.dismissByKey('load:foo')
+    })
+    expect(result.current.notifications).toHaveLength(1)
+    expect(result.current.notifications[0].key).toBe('load:bar')
+  })
+
+  it('replaceOngoingBanners atomically swaps the ongoing set, leaving toasts alone', () => {
+    const { result } = renderHook(() => useNotifications(), { wrapper })
+
+    act(() => {
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'old1', key: 'load:a' })
+      result.current.addNotification({ severity: 'warn', persistence: 'ongoing', message: 'old2', key: 'load:b' })
+      result.current.addNotification({ severity: 'error', persistence: 'one-shot', message: 'toast' })
+    })
+    expect(result.current.notifications).toHaveLength(3)
+
+    act(() => {
+      result.current.replaceOngoingBanners([
+        { severity: 'warn', persistence: 'ongoing', message: 'new1', key: 'load:c' },
+      ])
+    })
+
+    // Toast survives; old ongoing entries gone; new ongoing entry present.
+    expect(result.current.notifications).toHaveLength(2)
+    expect(result.current.notifications.filter(n => n.persistence === 'ongoing')).toHaveLength(1)
+    expect(result.current.notifications.find(n => n.persistence === 'ongoing')?.message).toBe('new1')
+    expect(result.current.notifications.filter(n => n.persistence === 'one-shot')).toHaveLength(1)
+  })
+
   it('dismissNotification removes a specific notification and clears its timer', () => {
     const { result } = renderHook(() => useNotifications(), { wrapper })
 
     let firstId = ''
     let secondId = ''
     act(() => {
-      firstId = result.current.addNotification({ level: 'info', message: 'first', autoDismissMs: 5000 })
-      secondId = result.current.addNotification({ level: 'info', message: 'second', autoDismissMs: 5000 })
+      firstId = result.current.addNotification({ severity: 'info', persistence: 'one-shot', message: 'first' })
+      secondId = result.current.addNotification({ severity: 'info', persistence: 'one-shot', message: 'second' })
     })
     expect(result.current.notifications).toHaveLength(2)
 
@@ -83,7 +145,7 @@ describe('useNotifications', () => {
     // Advance past the dismissed notification's original autoDismissMs.
     // Should NOT crash trying to dismiss an already-removed entry.
     act(() => {
-      vi.advanceTimersByTime(5000)
+      vi.advanceTimersByTime(6000)
     })
     expect(result.current.notifications).toHaveLength(0)
   })

@@ -3,11 +3,11 @@ package runner
 import (
 	"context"
 	"io"
-	"log/slog"
 	"testing"
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
+	"go-python-runner/internal/notify"
 
 	"google.golang.org/grpc/metadata"
 )
@@ -56,8 +56,6 @@ func FuzzClientMessageHandler(f *testing.F) {
 	f.Add(uint8(7), "key", "", int32(0), int32(0), []byte{})       // CacheRelease
 	f.Add(uint8(99), "", "", int32(0), int32(0), []byte{})         // unset oneof
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-
 	cache := NewCacheManager()
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -67,10 +65,10 @@ func FuzzClientMessageHandler(f *testing.F) {
 		f.Fatal(err)
 	}
 	srv := &GRPCServer{
-		runs:   make(map[string]*RunChannel),
-		cache:  cache,
-		db:     store,
-		logger: logger,
+		runs:      make(map[string]*RunChannel),
+		cache:     cache,
+		db:        store,
+		reservoir: &notify.RecordingReservoir{},
 	}
 
 	f.Fuzz(func(t *testing.T, variant uint8, s1, s2 string, i1, i2 int32, b []byte) {

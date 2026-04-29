@@ -3,14 +3,13 @@
 package stress
 
 import (
-	"log/slog"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/runner"
 
 	"context"
@@ -25,7 +24,6 @@ import (
 //   - errorMessage non-nil iff gotError set
 //   - flag transitions are monotonic (set → set, never set → unset)
 func TestRunChannelFlagConsistency(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	cache := runner.NewCacheManager()
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -34,7 +32,7 @@ func TestRunChannelFlagConsistency(t *testing.T) {
 	if err := store.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := runner.NewGRPCServer(cache, store, logger)
+	srv, err := runner.NewGRPCServer(cache, store, &notify.RecordingReservoir{})
 	if err != nil {
 		t.Fatal(err)
 	}

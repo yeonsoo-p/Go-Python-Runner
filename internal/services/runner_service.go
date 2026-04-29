@@ -1,10 +1,11 @@
 package services
 
 import (
+	"errors"
 	"fmt"
-	"log/slog"
 	"sync/atomic"
 
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 	"go-python-runner/internal/runner"
 
@@ -13,18 +14,21 @@ import (
 
 // RunnerService is a Wails service that manages script execution.
 type RunnerService struct {
-	manager  *runner.Manager
-	registry *registry.Registry
-	logger   *slog.Logger
-	app      atomic.Pointer[application.App] // set after Wails init, read from goroutines
+	manager   *runner.Manager
+	registry  *registry.Registry
+	reservoir notify.Reservoir
+	app       atomic.Pointer[application.App] // set after Wails init, read from goroutines
 }
 
-// NewRunnerService creates a new RunnerService.
-func NewRunnerService(mgr *runner.Manager, reg *registry.Registry, logger *slog.Logger) *RunnerService {
+// NewRunnerService creates a new RunnerService. The reservoir is the sole
+// observability dependency — every user-visible error and trace event flows
+// through reservoir.Report, including script output and data-result traces
+// (which route to log-only via Severity=Info + Persistence=OneShot).
+func NewRunnerService(mgr *runner.Manager, reg *registry.Registry, reservoir notify.Reservoir) *RunnerService {
 	return &RunnerService{
-		manager:  mgr,
-		registry: reg,
-		logger:   logger,
+		manager:   mgr,
+		registry:  reg,
+		reservoir: reservoir,
 	}
 }
 
@@ -38,12 +42,32 @@ func (s *RunnerService) SetApp(app *application.App) {
 func (s *RunnerService) StartRun(scriptID string, params map[string]string) (string, error) {
 	script, ok := s.registry.Get(scriptID)
 	if !ok {
-		return "", fmt.Errorf("script not found: %s", scriptID)
+		err := fmt.Errorf("script not found: %s", scriptID)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Run not started",
+			Message:     err.Error(),
+			ScriptID:    scriptID,
+			Err:         err,
+		})
+		return "", err
 	}
 
 	runID, msgCh, err := s.manager.StartRun(scriptID, params, script.Dir)
 	if err != nil {
-		return "", fmt.Errorf("starting run for %s: %w", scriptID, err)
+		wrapped := fmt.Errorf("starting run for %s: %w", scriptID, err)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Run not started",
+			Message:     wrapped.Error(),
+			ScriptID:    scriptID,
+			Err:         wrapped,
+		})
+		return "", wrapped
 	}
 
 	// Goroutine: read messages from the channel and emit Wails events
@@ -58,10 +82,30 @@ func (s *RunnerService) StartRun(scriptID string, params map[string]string) (str
 func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]string, workerCount int) ([]string, error) {
 	script, ok := s.registry.Get(scriptID)
 	if !ok {
-		return nil, fmt.Errorf("script not found: %s", scriptID)
+		err := fmt.Errorf("script not found: %s", scriptID)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Parallel run not started",
+			Message:     err.Error(),
+			ScriptID:    scriptID,
+			Err:         err,
+		})
+		return nil, err
 	}
 	if script.Parallel == nil {
-		return nil, fmt.Errorf("script %s does not support parallel execution", scriptID)
+		err := fmt.Errorf("script %s does not support parallel execution", scriptID)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Parallel run not started",
+			Message:     err.Error(),
+			ScriptID:    scriptID,
+			Err:         err,
+		})
+		return nil, err
 	}
 
 	pc := script.Parallel
@@ -103,17 +147,39 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 
 		runID, msgCh, err := s.manager.StartRun(scriptID, wp, script.Dir)
 		if err != nil {
-			// Cancel already-started runs on failure.
+			// Cancel already-started runs on failure. Each rollback failure is
+			// surfaced individually (toast) AND folded into the joined error
+			// returned to the frontend — no silent slog.Warn that the user
+			// can't see. See CLAUDE.md § Cascading failures.
+			primary := fmt.Errorf("starting worker %d for %s: %w", i, scriptID, err)
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Parallel run failed",
+				Message:     primary.Error(),
+				ScriptID:    scriptID,
+				Err:         primary,
+			})
+
+			var cleanup []error
 			for _, id := range runIDs {
 				if cancelErr := s.manager.CancelRun(id); cancelErr != nil {
-					s.logger.Warn("rollback cancel failed",
-						"runID", id,
-						"error", cancelErr.Error(),
-						"source", "backend",
-					)
+					rollbackErr := fmt.Errorf("rollback %s: %w", id, cancelErr)
+					s.reservoir.Report(notify.Event{
+						Severity:    notify.SeverityError,
+						Persistence: notify.PersistenceOneShot,
+						Source:      notify.SourceBackend,
+						Title:       "Parallel rollback incomplete",
+						Message:     rollbackErr.Error(),
+						RunID:       id,
+						ScriptID:    scriptID,
+						Err:         rollbackErr,
+					})
+					cleanup = append(cleanup, rollbackErr)
 				}
 			}
-			return nil, fmt.Errorf("starting worker %d for %s: %w", i, scriptID, err)
+			return nil, errors.Join(append([]error{primary}, cleanup...)...)
 		}
 
 		go s.forwardMessages(runID, scriptID, msgCh)
@@ -141,12 +207,14 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"scriptID": scriptID,
 				"text":     m.Text,
 			})
-			s.logger.Info("script output",
-				"text", m.Text,
-				"source", "python",
-				"runID", runID,
-				"scriptID", scriptID,
-			)
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityInfo,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourcePython,
+				Message:     m.Text,
+				RunID:       runID,
+				ScriptID:    scriptID,
+			})
 		case runner.ProgressMsg:
 			app.Event.Emit("run:progress", map[string]any{
 				"runID":    runID,
@@ -161,19 +229,33 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"scriptID": scriptID,
 				"state":    string(m.State),
 			})
+			// Mid-run terminal toast: a collapsed task card no longer fails
+			// silently. Manager is the authoritative source of terminal state
+			// (see manager.waitForExit), but we only learn the scriptID here,
+			// so the toast originates at this layer.
+			if m.State == runner.StatusFailed {
+				s.reservoir.Report(notify.Event{
+					Severity:    notify.SeverityError,
+					Persistence: notify.PersistenceOneShot,
+					Source:      notify.SourceBackend,
+					Title:       "Run failed",
+					Message:     fmt.Sprintf("%s failed", scriptID),
+					RunID:       runID,
+					ScriptID:    scriptID,
+				})
+			}
 		case runner.ErrorMsg:
-			app.Event.Emit("run:error", map[string]string{
-				"runID":     runID,
-				"scriptID":  scriptID,
-				"message":   m.Message,
-				"traceback": m.Traceback,
+			// In-flight error: routes to the per-run pane (run:error) and
+			// also writes a slog.Error record for the LogViewer / log file.
+			s.reservoir.Report(notify.Event{
+				Severity:    severityFromProto(m.Severity),
+				Persistence: notify.PersistenceInFlight,
+				Source:      notify.SourcePython,
+				Message:     m.Message,
+				RunID:       runID,
+				ScriptID:    scriptID,
+				Traceback:   m.Traceback,
 			})
-			s.logger.Error(m.Message,
-				"source", "python",
-				"runID", runID,
-				"scriptID", scriptID,
-				"traceback", m.Traceback,
-			)
 		case runner.DataMsg:
 			app.Event.Emit("run:data", map[string]any{
 				"runID":    runID,
@@ -181,12 +263,30 @@ func (s *RunnerService) forwardMessages(runID, scriptID string, ch <-chan runner
 				"key":      m.Key,
 				"value":    m.Value,
 			})
-			s.logger.Info("script data result",
-				"key", m.Key,
-				"source", "python",
-				"runID", runID,
-				"scriptID", scriptID,
-			)
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityInfo,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourcePython,
+				Message:     fmt.Sprintf("data result: key=%s", m.Key),
+				RunID:       runID,
+				ScriptID:    scriptID,
+			})
 		}
+	}
+}
+
+// severityFromProto maps the proto Severity enum value carried on ErrorMsg
+// to the notify.Severity type. Unspecified defaults to Error for back-compat
+// with scripts that predate the severity field.
+func severityFromProto(p int32) notify.Severity {
+	switch p {
+	case 1: // SEVERITY_INFO
+		return notify.SeverityInfo
+	case 2: // SEVERITY_WARN
+		return notify.SeverityWarn
+	case 4: // SEVERITY_CRITICAL
+		return notify.SeverityCritical
+	default: // 0 (UNSPECIFIED) and 3 (ERROR)
+		return notify.SeverityError
 	}
 }

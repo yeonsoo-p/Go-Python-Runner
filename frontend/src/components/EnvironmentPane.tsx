@@ -64,7 +64,7 @@ function EnvironmentPane() {
     const fp = (file as FileWithPath).path
     const path = fp || (file as FileWithPath).webkitRelativePath || file.name
     if (!file.name.toLowerCase().endsWith('.txt')) {
-      addNotification({ level: 'error', message: 'Only .txt files are accepted' })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Only .txt files are accepted' })
       return
     }
     await installRequirements(path)
@@ -77,7 +77,7 @@ function EnvironmentPane() {
     const file = e.dataTransfer.files?.[0]
     if (!file) return
     if (!file.name.toLowerCase().endsWith('.txt')) {
-      addNotification({ level: 'error', message: 'Only .txt files are accepted' })
+      addNotification({ severity: 'error', persistence: 'one-shot', source: 'frontend', message: 'Only .txt files are accepted' })
       return
     }
     type FileWithPath = File & { path?: string }

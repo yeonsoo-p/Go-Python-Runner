@@ -6,6 +6,8 @@ function LogViewer() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [sourceFilter, setSourceFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState('')
+  const [runIDFilter, setRunIDFilter] = useState('')
+  const [scriptIDFilter, setScriptIDFilter] = useState('')
   const cleanupRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
@@ -58,6 +60,8 @@ function LogViewer() {
   const filteredLogs = logs.filter(log => {
     if (sourceFilter && log.Source !== sourceFilter) return false
     if (levelFilter && log.Level !== levelFilter) return false
+    if (runIDFilter && !log.RunID?.includes(runIDFilter)) return false
+    if (scriptIDFilter && !log.ScriptID?.includes(scriptIDFilter)) return false
     return true
   })
 
@@ -96,6 +100,20 @@ function LogViewer() {
           <option value="INFO">Info</option>
           <option value="DEBUG">Debug</option>
         </select>
+        <input
+          type="text"
+          value={runIDFilter}
+          onChange={e => setRunIDFilter(e.target.value)}
+          placeholder="runID"
+          className="text-sm px-2 py-1 w-32 rounded bg-slate-700 border border-slate-600 placeholder:text-slate-500 font-mono"
+        />
+        <input
+          type="text"
+          value={scriptIDFilter}
+          onChange={e => setScriptIDFilter(e.target.value)}
+          placeholder="scriptID"
+          className="text-sm px-2 py-1 w-32 rounded bg-slate-700 border border-slate-600 placeholder:text-slate-500 font-mono"
+        />
       </div>
 
       <div className="bg-slate-900 rounded max-h-64 overflow-y-auto font-mono text-xs">

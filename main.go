@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"go-python-runner/internal/db"
 	"go-python-runner/internal/logging"
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 	"go-python-runner/internal/runner"
 	"go-python-runner/internal/services"
@@ -24,7 +26,8 @@ var version = "0.0.0.0"
 var assets embed.FS
 
 func main() {
-	// Initialize logging
+	// Initialize logging. log.Fatalf is fine here: this is the only path
+	// that runs before the reservoir exists.
 	const ringBufferCapacity = 1000
 	ring := logging.NewRingBuffer(ringBufferCapacity)
 	logger, err := logging.NewLogger(logging.DefaultLogDir(), ring)
@@ -33,7 +36,14 @@ func main() {
 	}
 	slog.SetDefault(logger)
 
-	// Initialize database
+	// Initialize central notification reservoir. Every UI-visible error from
+	// Python, Go services, or the frontend goes through this single ingress.
+	// See internal/notify/notify.go and CLAUDE.md § Error Handling.
+	reservoir := notify.New(logger)
+
+	// Initialize database. log.Fatalf paths still apply here — without a DB
+	// there's no point continuing, and the app hasn't booted yet so a toast
+	// would not reach a user anyway.
 	dsn := os.Getenv("PYRUNNER_DB")
 	if dsn == "" {
 		dsn, err = db.DefaultDSN()
@@ -49,62 +59,107 @@ func main() {
 	if err := store.Migrate(); err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
 	}
-	logger.Info("database initialized", "dsn", dsn, "source", "backend")
+	reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "database initialized: " + dsn,
+	})
 
 	// Initialize script registry
-	reg := registry.New(logger)
+	reg := registry.New(reservoir)
 	scriptsDir := findScriptsDir()
 	pluginDir := registry.DefaultPluginDir()
 	// Best-effort: ensure the plugin dir exists so the watcher can attach.
 	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
-		logger.Warn("could not create plugin dir", "dir", pluginDir, "error", err.Error(), "source", "backend")
+		reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Plugin dir unavailable",
+			Message:     "could not create plugin dir " + pluginDir,
+			Err:         err,
+		})
 	}
 	if err := reg.LoadBuiltin(scriptsDir); err != nil {
-		logger.Warn("failed to load builtin scripts", "error", err.Error())
+		reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Builtin scripts load failed",
+			Message:     err.Error(),
+			Err:         err,
+		})
 	}
 	if err := reg.LoadPlugins(pluginDir); err != nil {
-		logger.Warn("failed to load plugin scripts", "error", err.Error())
+		reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Plugin scripts load failed",
+			Message:     err.Error(),
+			Err:         err,
+		})
 	}
-	logger.Info("scripts loaded",
-		"count", len(reg.List()),
-		"scriptsDir", scriptsDir,
-		"pluginDir", reg.PluginDir(),
-		"issues", len(reg.Issues()),
-		"source", "backend",
-	)
+	reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message: fmt.Sprintf("scripts loaded: count=%d scriptsDir=%s pluginDir=%s issues=%d",
+			len(reg.List()), scriptsDir, reg.PluginDir(), len(reg.Issues())),
+	})
 
 	// Initialize cache manager
 	cache := runner.NewCacheManager()
 
 	// Initialize gRPC server
-	grpcServer, err := runner.NewGRPCServer(cache, store, logger)
+	grpcServer, err := runner.NewGRPCServer(cache, store, reservoir)
 	if err != nil {
 		log.Fatalf("failed to start gRPC server: %v", err)
 	}
 	defer grpcServer.Stop()
-	logger.Info("gRPC server started", "addr", grpcServer.Addr(), "source", "backend")
+	reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "gRPC server started: addr=" + grpcServer.Addr(),
+	})
 
 	// Monitor gRPC server for runtime failures
 	go func() {
 		if err := <-grpcServer.ServeErr(); err != nil {
-			logger.Error("gRPC server died, script execution will not work", "error", err.Error(), "source", "backend")
+			reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOngoing,
+				Source:      notify.SourceBackend,
+				Key:         "grpc:server:dead",
+				Title:       "gRPC server died",
+				Message:     "script execution will not work: " + err.Error(),
+				Err:         err,
+			})
 		}
 	}()
 
 	// Initialize process manager
-	mgr := runner.NewManager(grpcServer, cache, store, logger)
+	mgr := runner.NewManager(grpcServer, cache, store, reservoir)
 	mgr.LibDir = filepath.Join(scriptsDir, "_lib")
 
 	// Create Wails services
-	scriptSvc := services.NewScriptService(reg, logger, scriptsDir, pluginDir)
-	runnerSvc := services.NewRunnerService(mgr, reg, logger)
-	logSvc := services.NewLogService(logger, ring)
-	envSvc, envErr := services.NewEnvService(logger)
+	scriptSvc := services.NewScriptService(reg, reservoir, scriptsDir, pluginDir)
+	runnerSvc := services.NewRunnerService(mgr, reg, reservoir)
+	logSvc := services.NewLogService(ring, reservoir)
+	envSvc, envErr := services.NewEnvService(reservoir)
 	if envErr != nil {
 		// Non-fatal: env management UI is hidden if no venv resolved.
 		// Scripts still run via the Manager's own Python resolution.
-		logger.Warn("env service unavailable, environment pane disabled",
-			"error", envErr.Error(), "source", "backend")
+		reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Env service unavailable",
+			Message:     "environment pane disabled: " + envErr.Error(),
+			Err:         envErr,
+		})
 	}
 
 	// Create Wails application
@@ -125,7 +180,11 @@ func main() {
 		},
 	})
 
-	// Give services and gRPC server access to the app
+	// Give services, reservoir, and gRPC server access to the app.
+	// reservoir.SetApp must run before the watcher / gRPC traffic so any
+	// early-startup errors actually emit Wails events instead of being
+	// dropped silently.
+	reservoir.SetApp(app)
 	runnerSvc.SetApp(app)
 	logSvc.SetApp(app)
 	scriptSvc.SetApp(app)
@@ -138,10 +197,17 @@ func main() {
 	// scriptSvc.NotifyChanged → scripts:changed Wails event.
 	watcherCtx, cancelWatcher := context.WithCancel(context.Background())
 	defer cancelWatcher()
-	watcher := registry.NewWatcher(reg, scriptsDir, pluginDir, scriptSvc.NotifyChanged, logger)
+	watcher := registry.NewWatcher(reg, scriptsDir, pluginDir, scriptSvc.NotifyChanged, reservoir)
 	go func() {
 		if err := watcher.Run(watcherCtx); err != nil {
-			logger.Error("script watcher exited with error", "error", err.Error(), "source", "backend")
+			reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Script watcher exited",
+				Message:     err.Error(),
+				Err:         err,
+			})
 		}
 	}()
 
@@ -215,3 +281,4 @@ func findScriptsDir() string {
 
 	return "scripts"
 }
+

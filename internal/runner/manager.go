@@ -3,13 +3,13 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
 	"go-python-runner/internal/db"
+	"go-python-runner/internal/notify"
 )
 
 // maxStderrLog is the maximum number of bytes of stderr output to log.
@@ -56,20 +56,22 @@ type Manager struct {
 	grpc       *GRPCServer
 	cache      *CacheManager
 	db         *db.DB
-	logger     *slog.Logger
+	reservoir  notify.Reservoir
 	PythonPath string // optional override for python path
 	LibDir     string // path to scripts/_lib (prepended to PYTHONPATH for spawned scripts)
 }
 
 // NewManager creates a new process manager.
 // If store is non-nil, persisted run history is loaded from SQLite.
-func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, logger *slog.Logger) *Manager {
+// The reservoir is the sole observability dependency — every trace, warn,
+// and error event flows through reservoir.Report.
+func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, reservoir notify.Reservoir) *Manager {
 	mgr := &Manager{
 		activeRuns: make(map[string]*RunState),
 		grpc:       grpc,
 		cache:      cache,
 		db:         store,
-		logger:     logger,
+		reservoir:  reservoir,
 	}
 	if store != nil {
 		mgr.loadHistory()
@@ -84,7 +86,14 @@ func (m *Manager) loadHistory() {
 			"WHERE status IN ('completed', 'failed') ORDER BY started_at DESC",
 	)
 	if err != nil {
-		m.logger.Warn("failed to load run history from database", "error", err.Error(), "source", "backend")
+		m.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Run history load failed",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return
 	}
 	defer rows.Close()
@@ -93,7 +102,14 @@ func (m *Manager) loadHistory() {
 		var rec RunRecord
 		var status string
 		if err := rows.Scan(&rec.RunID, &rec.ScriptID, &status, &rec.StartedAt, &rec.EndedAt); err != nil {
-			m.logger.Warn("failed to scan run history row", "error", err.Error(), "source", "backend")
+			m.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Run history scan failed",
+				Message:     err.Error(),
+				Err:         err,
+			})
 			continue
 		}
 		rec.Status = RunStatus(status)
@@ -133,11 +149,14 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 		m.activeRuns[runID] = state
 	}()
 
-	m.logger.Info("run started",
-		"runID", runID,
-		"scriptID", scriptID,
-		"source", "backend",
-	)
+	m.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "run started",
+		RunID:       runID,
+		ScriptID:    scriptID,
+	})
 
 	// Persist initial run record to SQLite for history across restarts.
 	if m.db != nil {
@@ -146,7 +165,15 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 			"INSERT INTO runs (id, script_id, status, params, started_at) VALUES (?, ?, ?, ?, ?)",
 			runID, scriptID, string(StatusRunning), string(paramsJSON), startedAt,
 		); err != nil {
-			m.logger.Warn("failed to record run start", "runID", runID, "error", err.Error(), "source", "backend")
+			m.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Run start record failed",
+				Message:     err.Error(),
+				RunID:       runID,
+				Err:         err,
+			})
 		}
 	}
 
@@ -175,16 +202,27 @@ func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc 
 		// Nothing to send; waitForExit handles the cleanup path.
 		return
 	case <-time.After(connectTimeout):
-		m.logger.Error("timeout waiting for Python to connect, killing process", "runID", runID, "source", "backend")
+		m.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Python connect timeout",
+			Message:     "timeout waiting for Python to connect, killing process",
+			RunID:       runID,
+		})
 		proc.Cancel()
 		return
 	}
 	if err := m.grpc.SendStart(runID, params); err != nil {
-		m.logger.Error("failed to send start params, killing process",
-			"runID", runID,
-			"error", err.Error(),
-			"source", "backend",
-		)
+		m.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Send start params failed",
+			Message:     err.Error(),
+			RunID:       runID,
+			Err:         err,
+		})
 		proc.Cancel()
 	}
 }
@@ -233,19 +271,25 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	finalStatus := m.deriveFinalStatus(runID, exitCode, err)
 
 	if finalStatus == StatusFailed && exitCode != 0 && stderrOutput != "" && !m.grpc.GotError(runID) {
-		// Process crashed without sending a structured error. Synthesize one
-		// so the frontend's error panel has something to display.
+		// Process crashed without sending a structured error. Route the
+		// captured stderr through the reservoir so the per-run pane (via
+		// run:error) and LogViewer (via slog) both see it through the same
+		// single ingress as structured errors. Persistence is InFlight so
+		// the routing matches a Python-originated fail() exactly.
 		logStderr := stderrOutput
 		if len(logStderr) > maxStderrLog {
 			logStderr = logStderr[:maxStderrLog] + "\n... (truncated)"
 		}
-		m.grpc.TrySendError(runID, logStderr)
-		m.logger.Error("script stderr",
-			"runID", runID,
-			"scriptID", scriptID,
-			"stderr", logStderr,
-			"source", "python",
-		)
+		m.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceInFlight,
+			Source:      notify.SourcePython,
+			Title:       "Script crashed",
+			Message:     logStderr,
+			RunID:       runID,
+			ScriptID:    scriptID,
+			Traceback:   logStderr,
+		})
 	}
 
 	// Sole emitter of run:status — frontend is guaranteed to receive exactly
@@ -277,12 +321,13 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 		if !s.Status.IsTerminal() {
 			s.Status = finalStatus
 		} else {
-			m.logger.Warn("ignoring status transition from terminal state",
-				"runID", runID,
-				"current", string(s.Status),
-				"attempted", string(finalStatus),
-				"source", "backend",
-			)
+			m.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Message:     fmt.Sprintf("ignoring status transition from terminal state: current=%s attempted=%s", s.Status, finalStatus),
+				RunID:       runID,
+			})
 		}
 		recordStatus = s.Status
 	}
@@ -302,17 +347,26 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 			"UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error_message = ? WHERE id = ?",
 			string(recordStatus), endedAt, exitCode, errorMessage, runID,
 		); dbErr != nil {
-			m.logger.Warn("failed to update run record", "runID", runID, "error", dbErr.Error(), "source", "backend")
+			m.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Run record update failed",
+				Message:     dbErr.Error(),
+				RunID:       runID,
+				Err:         dbErr,
+			})
 		}
 	}
 
-	m.logger.Info("run finished",
-		"runID", runID,
-		"scriptID", scriptID,
-		"status", recordStatus,
-		"exitCode", exitCode,
-		"source", "backend",
-	)
+	m.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     fmt.Sprintf("run finished: status=%s exitCode=%d", recordStatus, exitCode),
+		RunID:       runID,
+		ScriptID:    scriptID,
+	})
 }
 
 // CancelRun cancels a running script.
@@ -327,7 +381,14 @@ func (m *Manager) CancelRun(runID string) error {
 	// Try to send cancel via gRPC first. If it fails, kill immediately.
 	// If it succeeds, give the script a grace window to exit cleanly.
 	if err := m.grpc.SendCancel(runID); err != nil {
-		m.logger.Debug("gRPC cancel failed, killing process immediately", "runID", runID, "error", err.Error(), "source", "backend")
+		// Cancel-path failures are deep-trace; log-only via Info.
+		m.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityInfo,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Message:     fmt.Sprintf("gRPC cancel failed, killing process immediately: %s", err.Error()),
+			RunID:       runID,
+		})
 		state.cancel()
 	} else {
 		// Grace window: let the script notice is_cancelled() and exit cleanly.
@@ -335,7 +396,13 @@ func (m *Manager) CancelRun(runID string) error {
 		// the process already exited via waitForExit, this is a no-op.
 		time.AfterFunc(cancelGracePeriod, state.cancel)
 	}
-	m.logger.Info("run cancel requested", "runID", runID, "source", "backend")
+	m.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "run cancel requested",
+		RunID:       runID,
+	})
 	return nil
 }
 

@@ -5,6 +5,15 @@ import LogViewer from './components/LogViewer'
 import EnvironmentPane from './components/EnvironmentPane'
 import NotificationStack from './components/NotificationStack'
 import { NotificationsProvider } from './hooks/useNotifications'
+import { useNotifyChannel } from './hooks/useNotifyChannel'
+
+// NotifyChannelMount mounts useNotifyChannel inside the NotificationsProvider
+// so the central router has access to addNotification / dismissByKey /
+// replaceOngoingBanners. Renders nothing — it's just an effect host.
+function NotifyChannelMount() {
+  useNotifyChannel()
+  return null
+}
 
 class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -59,6 +68,7 @@ function App() {
   return (
     <ErrorBoundary>
       <NotificationsProvider>
+        <NotifyChannelMount />
         <div className="min-h-screen bg-slate-900 text-slate-200">
           <header className="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
             <div className="flex items-center gap-6">

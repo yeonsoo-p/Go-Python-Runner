@@ -3,7 +3,6 @@ package runner
 import (
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -11,6 +10,7 @@ import (
 
 	"go-python-runner/internal/db"
 	pb "go-python-runner/internal/gen"
+	"go-python-runner/internal/notify"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -27,7 +27,14 @@ type Message interface {
 type OutputMsg struct{ Text string }
 type ProgressMsg struct{ Current, Total int32; Label string }
 type StatusMsg struct{ State RunStatus }
-type ErrorMsg struct{ Message, Traceback string }
+type ErrorMsg struct {
+	Message, Traceback string
+	// Severity carries the proto runner.Severity enum value verbatim so
+	// downstream layers (RunnerService.forwardMessages) can map it to the
+	// appropriate notify.Severity. Zero (SEVERITY_UNSPECIFIED) means the
+	// caller didn't set one — treat as ERROR for back-compat.
+	Severity int32
+}
 type DataMsg struct{ Key string; Value []byte }
 
 func (OutputMsg) messageType()   {}
@@ -73,30 +80,32 @@ type FileFilterDef struct {
 type GRPCServer struct {
 	pb.UnimplementedPythonRunnerServer
 
-	mu       sync.RWMutex
-	runs     map[string]*RunChannel // runID -> channel
-	cache    *CacheManager
-	db       *db.DB
-	logger   *slog.Logger
-	server   *grpc.Server
-	listener net.Listener
-	dialog   atomic.Value // stores DialogHandler; set after Wails init, read from goroutines
-	serveErr chan error   // buffered(1), receives Serve() error if it fails
+	mu        sync.RWMutex
+	runs      map[string]*RunChannel // runID -> channel
+	cache     *CacheManager
+	db        *db.DB
+	reservoir notify.Reservoir
+	server    *grpc.Server
+	listener  net.Listener
+	dialog    atomic.Value // stores DialogHandler; set after Wails init, read from goroutines
+	serveErr  chan error   // buffered(1), receives Serve() error if it fails
 }
 
-// NewGRPCServer creates and starts a gRPC server on a random port.
-func NewGRPCServer(cache *CacheManager, store *db.DB, logger *slog.Logger) (*GRPCServer, error) {
+// NewGRPCServer creates and starts a gRPC server on a random port. The
+// reservoir is the sole observability dependency — DB errors, file dialog
+// failures, and serve-time crashes all flow through reservoir.Report.
+func NewGRPCServer(cache *CacheManager, store *db.DB, reservoir notify.Reservoir) (*GRPCServer, error) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 
 	s := &GRPCServer{
-		runs:     make(map[string]*RunChannel),
-		cache:    cache,
-		db:       store,
-		logger:   logger,
-		listener: lis,
+		runs:      make(map[string]*RunChannel),
+		cache:     cache,
+		db:        store,
+		reservoir: reservoir,
+		listener:  lis,
 	}
 
 	s.server = grpc.NewServer()
@@ -105,7 +114,14 @@ func NewGRPCServer(cache *CacheManager, store *db.DB, logger *slog.Logger) (*GRP
 	s.serveErr = make(chan error, 1)
 	go func() {
 		if err := s.server.Serve(lis); err != nil {
-			logger.Error("gRPC server error", "error", err.Error(), "source", "backend")
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "gRPC server error",
+				Message:     err.Error(),
+				Err:         err,
+			})
 			s.serveErr <- err
 		}
 	}()
@@ -275,17 +291,38 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 	s.mu.Unlock()
 	defer close(ch.streamDone)
 
-	s.logger.Info("Python client connected", "runID", runID, "source", "backend")
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "Python client connected",
+		RunID:       runID,
+	})
 
 	// Read messages from Python
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			s.logger.Debug("stream ended", "runID", runID, "error", err.Error(), "source", "backend")
+			// stream end is the normal exit path; log-only via Info.
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityInfo,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Message:     fmt.Sprintf("stream ended: %s", err.Error()),
+				RunID:       runID,
+			})
 			return nil
 		}
 		if sendErr := s.handleClientMessage(runID, ch, msg, stream); sendErr != nil {
-			s.logger.Error("stream send failed, closing", "runID", runID, "error", sendErr.Error(), "source", "backend")
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Stream send failed",
+				Message:     sendErr.Error(),
+				RunID:       runID,
+				Err:         sendErr,
+			})
 			return sendErr
 		}
 	}
@@ -331,6 +368,7 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 		ch.trySend(ErrorMsg{
 			Message:   m.Error.Message,
 			Traceback: m.Error.Traceback,
+			Severity:  int32(m.Error.Severity),
 		})
 	case *pb.ClientMessage_Data:
 		ch.trySend(DataMsg{
@@ -357,13 +395,13 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 
 func (s *GRPCServer) handleCacheCreate(runID string, req *pb.CacheCreate) {
 	s.cache.Register(req.Key, req.ShmName, req.Size, runID)
-	s.logger.Info("cache block registered",
-		"key", req.Key,
-		"shmName", req.ShmName,
-		"size", req.Size,
-		"runID", runID,
-		"source", "backend",
-	)
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     fmt.Sprintf("cache block registered: key=%s shm=%s size=%d", req.Key, req.ShmName, req.Size),
+		RunID:       runID,
+	})
 }
 
 func (s *GRPCServer) handleCacheLookup(runID string, ch *RunChannel, req *pb.CacheLookup) error {
@@ -382,17 +420,24 @@ func (s *GRPCServer) handleCacheLookup(runID string, ch *RunChannel, req *pb.Cac
 
 func (s *GRPCServer) handleCacheRelease(runID string, req *pb.CacheRelease) {
 	if released := s.cache.Release(req.Key, runID); released {
-		s.logger.Info("cache block released",
-			"key", req.Key,
-			"runID", runID,
-			"source", "backend",
-		)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityInfo,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Message:     fmt.Sprintf("cache block released: key=%s", req.Key),
+			RunID:       runID,
+		})
 	} else {
-		s.logger.Warn("cache release ignored: run was not referencing this block",
-			"key", req.Key,
-			"runID", runID,
-			"source", "backend",
-		)
+		// Warn+OneShot routes to log-only — the script asked to release a block
+		// it didn't reference; the operator should see this in the LogViewer
+		// but it doesn't warrant a UI surface.
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Message:     fmt.Sprintf("cache release ignored: run was not referencing key=%s", req.Key),
+			RunID:       runID,
+		})
 	}
 }
 
@@ -422,7 +467,15 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 
 	resp := &pb.FileDialogResponse{}
 	if err != nil {
-		s.logger.Error("file dialog error", "error", err.Error(), "runID", runID, "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "File dialog failed",
+			Message:     err.Error(),
+			RunID:       runID,
+			Err:         err,
+		})
 		resp.Cancelled = true
 		resp.Error = err.Error()
 	} else if path == "" {
@@ -448,6 +501,18 @@ func (s *GRPCServer) handleDbExecute(runID string, ch *RunChannel, req *pb.DbExe
 
 	result, err := s.db.Exec(req.Sql, args...)
 	if err != nil {
+		// Surface DB failures durably at the Go layer instead of relying on
+		// Python to re-emit them as ErrorMsgs. Even if the script swallows
+		// the SQL error, the operator sees it in the LogViewer.
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "SQL execute failed",
+			Message:     fmt.Sprintf("db.Exec: %s", err.Error()),
+			RunID:       runID,
+			Err:         err,
+		})
 		resp.Error = err.Error()
 	} else {
 		if ra, err := result.RowsAffected(); err == nil {
@@ -473,11 +538,29 @@ func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQuery
 
 	rows, err := s.db.Query(req.Sql, args...)
 	if err != nil {
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "SQL query failed",
+			Message:     fmt.Sprintf("db.Query: %s", err.Error()),
+			RunID:       runID,
+			Err:         err,
+		})
 		resp.Error = err.Error()
 	} else {
 		defer rows.Close()
 		cols, colErr := rows.Columns()
 		if colErr != nil {
+			s.reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "SQL query failed",
+				Message:     fmt.Sprintf("rows.Columns: %s", colErr.Error()),
+				RunID:       runID,
+				Err:         colErr,
+			})
 			resp.Error = colErr.Error()
 		} else {
 			resp.Columns = cols

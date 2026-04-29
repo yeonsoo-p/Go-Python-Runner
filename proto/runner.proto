@@ -58,9 +58,22 @@ message Status {
   string state = 1;
 }
 
+// Severity classifies a structured notification from any source (Python, Go,
+// frontend). The reservoir maps this onto a UI surface via persistence axis.
+// SEVERITY_UNSPECIFIED is treated as SEVERITY_ERROR for back-compat with
+// scripts predating the field.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO        = 1;
+  SEVERITY_WARN        = 2;
+  SEVERITY_ERROR       = 3;
+  SEVERITY_CRITICAL    = 4;
+}
+
 message Error {
   string message = 1;
   string traceback = 2;
+  Severity severity = 3;
 }
 
 message DataResult {

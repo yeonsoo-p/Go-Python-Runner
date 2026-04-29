@@ -2,12 +2,12 @@ package services
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 
 	"github.com/pkg/browser"
@@ -21,16 +21,19 @@ type pathOpener func(string) error
 // ScriptService is a Wails service that exposes script information to the frontend.
 type ScriptService struct {
 	registry    *registry.Registry
-	logger      *slog.Logger
+	reservoir   notify.Reservoir
 	app         atomic.Pointer[application.App]
-	allowedRoot []string  // absolute, normalized roots that OpenPath will permit
+	allowedRoot []string   // absolute, normalized roots that OpenPath will permit
 	openHook    pathOpener // injectable opener; defaults to browser.OpenFile
 }
 
 // NewScriptService creates a new ScriptService. allowedRoots are absolute paths
 // that bound which paths OpenPath will open — defense-in-depth against a
 // compromised frontend requesting arbitrary filesystem paths.
-func NewScriptService(reg *registry.Registry, logger *slog.Logger, allowedRoots ...string) *ScriptService {
+//
+// reservoir is the sole observability dependency; every user-visible error
+// from this service flows through reservoir.Report.
+func NewScriptService(reg *registry.Registry, reservoir notify.Reservoir, allowedRoots ...string) *ScriptService {
 	roots := make([]string, 0, len(allowedRoots))
 	for _, r := range allowedRoots {
 		if r == "" {
@@ -44,7 +47,7 @@ func NewScriptService(reg *registry.Registry, logger *slog.Logger, allowedRoots 
 	}
 	return &ScriptService{
 		registry:    reg,
-		logger:      logger,
+		reservoir:   reservoir,
 		allowedRoot: roots,
 		openHook:    browser.OpenFile,
 	}
@@ -62,7 +65,12 @@ func (s *ScriptService) NotifyChanged() {
 	if app := s.app.Load(); app != nil {
 		app.Event.Emit("scripts:changed", nil)
 	}
-	s.logger.Debug("scripts:changed emitted", "source", "backend")
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     "scripts:changed emitted",
+	})
 }
 
 // ListScripts returns all registered scripts in deterministic order.
@@ -83,30 +91,46 @@ func (s *ScriptService) OpenPath(absPath string) error {
 	clean := filepath.Clean(absPath)
 	if !s.isAllowedPath(clean) {
 		err := fmt.Errorf("path %q is outside allowed roots", absPath)
-		s.logger.Error("OpenPath rejected",
-			"path", absPath,
-			"error", err.Error(),
-			"source", "backend",
-		)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Open path rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	if _, err := os.Stat(clean); err != nil {
-		s.logger.Error("OpenPath stat failed",
-			"path", clean,
-			"error", err.Error(),
-			"source", "backend",
-		)
-		return fmt.Errorf("path does not exist: %w", err)
+		wrapped := fmt.Errorf("path does not exist: %w", err)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Open path failed",
+			Message:     wrapped.Error(),
+			Err:         wrapped,
+		})
+		return wrapped
 	}
 	if err := s.openHook(clean); err != nil {
-		s.logger.Error("OpenPath opener failed",
-			"path", clean,
-			"error", err.Error(),
-			"source", "backend",
-		)
-		return fmt.Errorf("opening %s: %w", clean, err)
+		wrapped := fmt.Errorf("opening %s: %w", clean, err)
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Open path failed",
+			Message:     wrapped.Error(),
+			Err:         wrapped,
+		})
+		return wrapped
 	}
-	s.logger.Info("OpenPath opened", "path", clean, "source", "backend")
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     fmt.Sprintf("OpenPath opened %s", clean),
+	})
 	return nil
 }
 

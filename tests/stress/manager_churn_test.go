@@ -5,7 +5,6 @@ package stress
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"go-python-runner/internal/db"
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/runner"
 )
 
@@ -24,7 +24,6 @@ import (
 // cleanup func that stops the gRPC server.
 func stressSetup(t *testing.T) (*runner.Manager, func()) {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	cache := runner.NewCacheManager()
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -33,11 +32,12 @@ func stressSetup(t *testing.T) (*runner.Manager, func()) {
 	if err := store.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := runner.NewGRPCServer(cache, store, logger)
+	rec := &notify.RecordingReservoir{}
+	srv, err := runner.NewGRPCServer(cache, store, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := runner.NewManager(srv, cache, store, logger)
+	mgr := runner.NewManager(srv, cache, store, rec)
 
 	projectRoot, _ := filepath.Abs(filepath.Join("..", ".."))
 	pythonPath := filepath.Join(projectRoot, ".venv", "Scripts", "python.exe")

@@ -5,13 +5,24 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"go-python-runner/internal/notify"
 )
+
+// maxLoadIssues caps the LoadIssue slice so a flapping plugin (which
+// re-registers a fresh issue every fsnotify cycle) cannot balloon memory or
+// the banner stack. Oldest entries are dropped first.
+const maxLoadIssues = 50
+
+// loadIssueKeyPrefix is the banner-key prefix the registry owns. Every
+// LoadIssue becomes a banner under this namespace; ReplaceBannersByPrefix
+// uses it to atomically swap the current set on each scan.
+const loadIssueKeyPrefix = "loadIssue:"
 
 // Param describes a single parameter for a script.
 //
@@ -65,14 +76,17 @@ type Registry struct {
 	issues      []LoadIssue
 	fingerprint string // of (scripts + issues), used by Reload to skip no-op swaps
 	pluginDir   string
-	logger      *slog.Logger
+	reservoir   notify.Reservoir
 }
 
-// New creates a new Registry.
-func New(logger *slog.Logger) *Registry {
+// New creates a new Registry. The reservoir is the sole observability
+// dependency — every LoadIssue produces an ongoing banner via
+// ReplaceBannersByPrefix on each load, and plugin-override warnings flow
+// through reservoir.Report.
+func New(reservoir notify.Reservoir) *Registry {
 	return &Registry{
-		scripts: make(map[string]Script),
-		logger:  logger,
+		scripts:   make(map[string]Script),
+		reservoir: reservoir,
 	}
 }
 
@@ -84,12 +98,14 @@ func (r *Registry) LoadBuiltin(scriptsDir string) error {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for id, s := range scripts {
 		r.scripts[id] = s
 	}
-	r.issues = append(r.issues, issues...)
+	r.issues = appendIssuesCapped(r.issues, issues)
 	r.fingerprint = computeFingerprint(r.scripts, r.issues)
+	snapshot := append([]LoadIssue(nil), r.issues...)
+	r.mu.Unlock()
+	r.reservoir.ReplaceBannersByPrefix(loadIssueKeyPrefix, loadIssuesToEvents(snapshot))
 	return nil
 }
 
@@ -109,20 +125,25 @@ func (r *Registry) LoadPlugins(pluginDir string) error {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var overrides []overrideNotice
 	for id, s := range scripts {
 		if existing, exists := r.scripts[id]; exists {
-			r.logger.Warn("plugin overriding builtin script",
-				"scriptID", id,
-				"builtinDir", existing.Dir,
-				"pluginDir", s.Dir,
-				"source", "backend",
-			)
+			overrides = append(overrides, overrideNotice{
+				scriptID:   id,
+				builtinDir: existing.Dir,
+				pluginDir:  s.Dir,
+			})
 		}
 		r.scripts[id] = s
 	}
-	r.issues = append(r.issues, issues...)
+	r.issues = appendIssuesCapped(r.issues, issues)
 	r.fingerprint = computeFingerprint(r.scripts, r.issues)
+	snapshot := append([]LoadIssue(nil), r.issues...)
+	r.mu.Unlock()
+	for _, o := range overrides {
+		r.reportOverride(o)
+	}
+	r.reservoir.ReplaceBannersByPrefix(loadIssueKeyPrefix, loadIssuesToEvents(snapshot))
 	return nil
 }
 
@@ -133,6 +154,7 @@ func (r *Registry) LoadPlugins(pluginDir string) error {
 func (r *Registry) Reload(scriptsDir, pluginDir string) (bool, error) {
 	newScripts := make(map[string]Script)
 	var newIssues []LoadIssue
+	var overrides []overrideNotice
 
 	// Builtin first; plugin overrides last so its IDs win.
 	if scriptsDir != "" {
@@ -152,12 +174,12 @@ func (r *Registry) Reload(scriptsDir, pluginDir string) (bool, error) {
 				return false, fmt.Errorf("scanning plugin dir: %w", err)
 			}
 			for id, sc := range s {
-				if _, overrides := newScripts[id]; overrides {
-					r.logger.Warn("plugin overriding builtin script",
-						"scriptID", id,
-						"pluginDir", sc.Dir,
-						"source", "backend",
-					)
+				if existing, override := newScripts[id]; override {
+					overrides = append(overrides, overrideNotice{
+						scriptID:   id,
+						builtinDir: existing.Dir,
+						pluginDir:  sc.Dir,
+					})
 				}
 				newScripts[id] = sc
 			}
@@ -165,16 +187,25 @@ func (r *Registry) Reload(scriptsDir, pluginDir string) (bool, error) {
 		}
 	}
 
+	if overflow := len(newIssues) - maxLoadIssues; overflow > 0 {
+		newIssues = newIssues[overflow:]
+	}
 	newFingerprint := computeFingerprint(newScripts, newIssues)
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if newFingerprint == r.fingerprint {
+		r.mu.Unlock()
 		return false, nil
 	}
 	r.scripts = newScripts
 	r.issues = newIssues
 	r.fingerprint = newFingerprint
+	snapshot := append([]LoadIssue(nil), r.issues...)
+	r.mu.Unlock()
+	for _, o := range overrides {
+		r.reportOverride(o)
+	}
+	r.reservoir.ReplaceBannersByPrefix(loadIssueKeyPrefix, loadIssuesToEvents(snapshot))
 	return true, nil
 }
 
@@ -236,9 +267,30 @@ func DefaultPluginDir() string {
 	return filepath.Join(configDir, "go-python-runner", "scripts")
 }
 
+// overrideNotice carries the data needed to report a plugin-over-builtin
+// override after the lock is released. Computed under the lock; reported
+// outside it so reservoir.Report doesn't run with the registry mutex held.
+type overrideNotice struct {
+	scriptID   string
+	builtinDir string
+	pluginDir  string
+}
+
+func (r *Registry) reportOverride(o overrideNotice) {
+	r.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityWarn,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Title:       "Plugin overriding builtin script",
+		Message:     fmt.Sprintf("plugin %s at %s overrides builtin at %s", o.scriptID, o.pluginDir, o.builtinDir),
+		ScriptID:    o.scriptID,
+	})
+}
+
 // buildFromDir scans dir and returns (scripts by id, load issues, fatal error).
 // A fatal error means the directory itself can't be read; per-script failures
-// become LoadIssue records and don't fail the whole scan.
+// become LoadIssue records (which become banners via ReplaceBannersByPrefix
+// at the caller) and don't fail the whole scan.
 func (r *Registry) buildFromDir(dir, source string) (map[string]Script, []LoadIssue, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -259,11 +311,6 @@ func (r *Registry) buildFromDir(dir, source string) (map[string]Script, []LoadIs
 		scriptDir := filepath.Join(dir, entry.Name())
 		script, loadErr := r.loadScript(scriptDir, source)
 		if loadErr != nil {
-			r.logger.Warn("skipping malformed script",
-				"dir", scriptDir,
-				"error", loadErr.Error(),
-				"source", "backend",
-			)
 			issues = append(issues, LoadIssue{
 				Dir:       scriptDir,
 				Source:    source,
@@ -315,6 +362,37 @@ func (r *Registry) loadScript(dir string, source string) (Script, error) {
 	script.Source = source
 	script.Dir = dir
 	return script, nil
+}
+
+// appendIssuesCapped appends new issues and trims the front of the slice to
+// stay within maxLoadIssues. Drops oldest entries first so a flapping plugin
+// can't push useful issues out beyond the cap.
+func appendIssuesCapped(existing, additions []LoadIssue) []LoadIssue {
+	combined := append(existing, additions...)
+	if overflow := len(combined) - maxLoadIssues; overflow > 0 {
+		combined = combined[overflow:]
+	}
+	return combined
+}
+
+// loadIssuesToEvents is a pure transform from LoadIssue records to the
+// notify.Event slice expected by ReplaceBannersByPrefix. Each issue becomes
+// one banner keyed by its directory so re-emissions across rescan cycles
+// dedupe via Key.
+func loadIssuesToEvents(issues []LoadIssue) []notify.Event {
+	events := make([]notify.Event, 0, len(issues))
+	for _, iss := range issues {
+		events = append(events, notify.Event{
+			Severity:    notify.SeverityWarn,
+			Persistence: notify.PersistenceOngoing,
+			Source:      notify.SourceBackend,
+			Key:         loadIssueKeyPrefix + iss.Dir,
+			Title:       "Plugin load issue",
+			Message:     fmt.Sprintf("%s: %s", iss.Dir, iss.Error),
+			Timestamp:   iss.Timestamp,
+		})
+	}
+	return events
 }
 
 // computeFingerprint hashes the visible state of the registry. Two registries

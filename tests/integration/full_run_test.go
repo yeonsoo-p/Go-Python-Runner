@@ -3,19 +3,18 @@
 package integration
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"go-python-runner/internal/db"
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/runner"
 )
 
 func testSetup(t *testing.T) (*runner.Manager, *runner.GRPCServer, func()) {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cache := runner.NewCacheManager()
 	store, err := db.Open(":memory:")
 	if err != nil {
@@ -24,11 +23,12 @@ func testSetup(t *testing.T) (*runner.Manager, *runner.GRPCServer, func()) {
 	if err := store.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	grpcServer, err := runner.NewGRPCServer(cache, store, logger)
+	rec := &notify.RecordingReservoir{}
+	grpcServer, err := runner.NewGRPCServer(cache, store, rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr := runner.NewManager(grpcServer, cache, store, logger)
+	mgr := runner.NewManager(grpcServer, cache, store, rec)
 
 	// Find Python from project root .venv
 	projectRoot, _ := filepath.Abs(filepath.Join("..", ".."))

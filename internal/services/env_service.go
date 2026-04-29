@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/runner"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -40,11 +40,11 @@ type Package struct {
 // running app resolved. Install/uninstall serialize through a mutex to
 // prevent pip lock-file races; ListPackages is lock-free.
 type EnvService struct {
-	info     EnvInfo
-	mu       sync.Mutex
-	busy     atomic.Bool
-	app      atomic.Pointer[application.App]
-	logger   *slog.Logger
+	info        EnvInfo
+	mu          sync.Mutex
+	busy        atomic.Bool
+	app         atomic.Pointer[application.App]
+	reservoir   notify.Reservoir
 	commandHook commandHook // injectable for tests; nil → real exec
 }
 
@@ -55,8 +55,9 @@ type commandHook func(ctx context.Context, name string, args ...string) *exec.Cm
 // NewEnvService probes the resolved venv and the available tooling. Returns
 // an error only if there's no venv at all; an unwritable venv yields a
 // service with Editable=false (install/uninstall still callable, but they
-// fail-fast with a clear error).
-func NewEnvService(logger *slog.Logger) (*EnvService, error) {
+// fail-fast with a clear error). The reservoir is the sole observability
+// dependency.
+func NewEnvService(reservoir notify.Reservoir) (*EnvService, error) {
 	venv, err := runner.FindVenv()
 	if err != nil {
 		return nil, fmt.Errorf("locating venv: %w", err)
@@ -83,16 +84,15 @@ func NewEnvService(logger *slog.Logger) (*EnvService, error) {
 		}
 	}
 
-	logger.Info("env service initialized",
-		"python", info.PythonPath,
-		"venv", info.VenvPath,
-		"tool", info.ToolName,
-		"version", info.PythonVersion,
-		"editable", info.Editable,
-		"source", "backend",
-	)
+	reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message: fmt.Sprintf("env service initialized: python=%s venv=%s tool=%s version=%s editable=%t",
+			info.PythonPath, info.VenvPath, info.ToolName, info.PythonVersion, info.Editable),
+	})
 
-	return &EnvService{info: info, logger: logger}, nil
+	return &EnvService{info: info, reservoir: reservoir}, nil
 }
 
 // SetApp wires the Wails app reference for emitting env:operation:* events.
@@ -121,12 +121,26 @@ func (s *EnvService) ListPackages() ([]Package, error) {
 	args := s.cmdArgs("list", "--format=json")
 	out, err := s.runCapture(args)
 	if err != nil {
-		s.logger.Error("ListPackages failed", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "ListPackages failed",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return nil, fmt.Errorf("listing packages: %w", err)
 	}
 	var pkgs []Package
 	if err := json.Unmarshal(out, &pkgs); err != nil {
-		s.logger.Error("ListPackages parse failed", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "ListPackages parse failed",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return nil, fmt.Errorf("parsing pip list output: %w", err)
 	}
 	return pkgs, nil
@@ -138,12 +152,26 @@ func (s *EnvService) ListPackages() ([]Package, error) {
 func (s *EnvService) InstallPackage(spec, indexURL string) error {
 	if spec == "" {
 		err := errors.New("install spec cannot be empty")
-		s.logger.Error("InstallPackage rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallPackage rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	if !s.info.Editable {
 		err := fmt.Errorf("venv at %s is not writable", s.info.VenvPath)
-		s.logger.Error("InstallPackage rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallPackage rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	return s.runInstall("install", spec, indexURL, []string{spec})
@@ -156,22 +184,50 @@ func (s *EnvService) InstallPackage(spec, indexURL string) error {
 func (s *EnvService) InstallRequirements(absPath, indexURL string) error {
 	if absPath == "" {
 		err := errors.New("requirements path cannot be empty")
-		s.logger.Error("InstallRequirements rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallRequirements rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	fi, err := os.Stat(absPath)
 	if err != nil {
-		s.logger.Error("InstallRequirements stat failed", "path", absPath, "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallRequirements stat failed",
+			Message:     fmt.Sprintf("path=%s: %s", absPath, err.Error()),
+			Err:         err,
+		})
 		return fmt.Errorf("requirements file: %w", err)
 	}
 	if fi.IsDir() {
 		err := fmt.Errorf("requirements path is a directory: %s", absPath)
-		s.logger.Error("InstallRequirements rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallRequirements rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	if !s.info.Editable {
 		err := fmt.Errorf("venv at %s is not writable", s.info.VenvPath)
-		s.logger.Error("InstallRequirements rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "InstallRequirements rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	return s.runInstall("install -r", absPath, indexURL, []string{"-r", absPath})
@@ -181,12 +237,26 @@ func (s *EnvService) InstallRequirements(absPath, indexURL string) error {
 func (s *EnvService) UninstallPackage(name string) error {
 	if name == "" {
 		err := errors.New("package name cannot be empty")
-		s.logger.Error("UninstallPackage rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "UninstallPackage rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	if !s.info.Editable {
 		err := fmt.Errorf("venv at %s is not writable", s.info.VenvPath)
-		s.logger.Error("UninstallPackage rejected", "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "UninstallPackage rejected",
+			Message:     err.Error(),
+			Err:         err,
+		})
 		return err
 	}
 	pkgArgs := []string{name}
@@ -199,11 +269,20 @@ func (s *EnvService) UninstallPackage(name string) error {
 
 // runInstall is the streamed-output execution path used by Install /
 // InstallRequirements / UninstallPackage. It serializes through s.mu so two
-// concurrent operations can't fight over the venv lock file.
+// concurrent operations can't fight over the venv lock file. The
+// env:operation:start/end emits are lifecycle signals (busy state) — error
+// reporting goes through the reservoir, not the emit payload.
 func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) error {
 	if !s.mu.TryLock() {
 		err := errors.New("another install/uninstall is already in flight")
-		s.logger.Error("runInstall rejected (busy)", "op", op, "error", err.Error(), "source", "backend")
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       "Operation busy",
+			Message:     fmt.Sprintf("op=%s: %s", op, err.Error()),
+			Err:         err,
+		})
 		return err
 	}
 	defer s.mu.Unlock()
@@ -227,19 +306,34 @@ func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) erro
 	s.emit("env:operation:start", map[string]any{"op": op, "spec": spec})
 
 	runErr := s.runStreamed(args)
+	// Lifecycle signal fires unconditionally so the frontend flips busy state
+	// in both success and failure paths. Errors flow through the reservoir.
+	s.emit("env:operation:end", map[string]any{"op": op, "spec": spec})
 	if runErr != nil {
-		s.logger.Error(op+" failed", "spec", spec, "error", runErr.Error(), "source", "backend")
-		s.emit("env:operation:end", map[string]any{"op": op, "spec": spec, "error": runErr.Error()})
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityError,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Title:       op + " failed",
+			Message:     fmt.Sprintf("%s %s: %s", op, spec, runErr.Error()),
+			Err:         runErr,
+		})
 		return fmt.Errorf("%s %s: %w", op, spec, runErr)
 	}
-	s.logger.Info(op+" succeeded", "spec", spec, "source", "backend")
-	s.emit("env:operation:end", map[string]any{"op": op, "spec": spec})
+	s.reservoir.Report(notify.Event{
+		Severity:    notify.SeverityInfo,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		Message:     fmt.Sprintf("%s succeeded: spec=%s", op, spec),
+	})
 	return nil
 }
 
 // cmdArgs returns the argv prefix appropriate to the resolved tool.
-//   uv:  uv pip <op> --python <python>
-//   pip: <python> -m pip <op>
+//
+//	uv:  uv pip <op> --python <python>
+//	pip: <python> -m pip <op>
+//
 // Caller passes the operation tail (e.g. "install", "pandas").
 func (s *EnvService) cmdArgs(tail ...string) []string {
 	switch s.info.ToolName {

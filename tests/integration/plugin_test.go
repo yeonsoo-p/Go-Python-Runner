@@ -3,17 +3,15 @@
 package integration
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 )
 
 func TestPluginOverride(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
 	builtinDir, err := filepath.Abs("testdata")
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +32,7 @@ func TestPluginOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := registry.New(logger)
+	reg := registry.New(&notify.RecordingReservoir{})
 	if err := reg.LoadBuiltin(builtinDir); err != nil {
 		t.Fatal(err)
 	}
