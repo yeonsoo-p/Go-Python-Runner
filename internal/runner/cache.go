@@ -88,6 +88,15 @@ func (cm *CacheManager) Release(key, runID string) bool {
 // CleanupRun removes a terminated run's references from all cache blocks.
 // Blocks with zero remaining references are deleted from the registry and
 // their underlying OS shared-memory names are unlinked (on Linux/macOS).
+//
+// CANONICAL cache-lifecycle authority. Manager.waitForExit calls this for
+// EVERY terminal status — graceful exit, crash, SIGKILL, cancel — so blocks
+// always get cleaned up regardless of how Python died. Mirrors Python's
+// best-effort atexit `_cleanup_cache` in runner.py, which only fires on
+// graceful shutdown; this method covers the cases atexit can't.
+//
+// Both paths are idempotent — finding zero refs to drop is a no-op.
+//
 // This plugs the leak when an owning Python process crashes via os._exit()
 // or SIGKILL — its atexit handler doesn't run, but Go cleans up here.
 // On Windows, the OS reclaims pagefile-backed shm when the last handle

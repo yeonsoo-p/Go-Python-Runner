@@ -214,9 +214,18 @@ def complete() -> None:
 
 
 def fail(message: str, tb: str | None = None) -> None:
-    """Send an error and failed status to Go."""
+    """Send an error and failed status to Go.
+
+    When called without an explicit ``tb`` outside an ``except`` block,
+    ``traceback.format_exc()`` returns the literal string ``"NoneType: None\\n"``
+    — meaningless metadata that misleadingly suggests an unhandled exception
+    occurred. Treat that as "no traceback available" so Go logs and the
+    LogViewer don't display the noise. Validation-style ``fail("bad input")``
+    calls now produce an empty traceback, which is the truth.
+    """
     if tb is None:
-        tb = traceback.format_exc()
+        captured = traceback.format_exc()
+        tb = "" if captured.strip() == "NoneType: None" else captured
     _send(runner_pb2.ClientMessage(error=runner_pb2.Error(message=str(message), traceback=str(tb))), _force=True)
     _send(runner_pb2.ClientMessage(status=runner_pb2.Status(state=STATUS_FAILED)), _force=True)
     _finish()
@@ -535,7 +544,20 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
 
 
 def _cleanup_cache() -> None:
-    """Close all shared memory references on exit, unlinking blocks we created."""
+    """Close shared memory references on graceful exit.
+
+    BEST-EFFORT cleanup. ``atexit`` only fires on normal interpreter shutdown —
+    not on ``os._exit()``, ``SIGKILL``, or ``CancelRun()`` from Go (which kills
+    the process via ``cmd.Process.Kill()``).
+
+    The CANONICAL authority for cache lifecycle is Go's ``CacheManager.CleanupRun``,
+    which runs in ``Manager.waitForExit`` for every terminal status (graceful and
+    forced). On Linux it also calls ``shm_unlink`` so dead-process blocks don't
+    leak in ``/dev/shm/``.
+
+    Both paths are idempotent: Go's CleanupRun finding zero refs is a no-op;
+    Python's atexit running after Go already unlinked is also a no-op.
+    """
     for key, shm in _cache_refs.items():
         with contextlib.suppress(OSError):
             shm.close()
