@@ -39,7 +39,9 @@ function Toast({ notification, onDismiss }: { notification: Notification; onDism
           </div>
           <div className="mt-1 break-words text-sm">{notification.message}</div>
           {notification.traceback && (
-            <details className="mt-1 text-xs opacity-80">
+            // stopPropagation so opening the disclosure doesn't bubble up
+            // to the toast's onClick={onDismiss} and close the toast.
+            <details className="mt-1 text-xs opacity-80" onClick={(e) => e.stopPropagation()}>
               <summary className="cursor-pointer">Traceback</summary>
               <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[10px] opacity-90">{notification.traceback}</pre>
             </details>
