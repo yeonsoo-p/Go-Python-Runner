@@ -149,48 +149,76 @@ func (p *Process) Done() <-chan struct{} {
 	return p.ctx.Done()
 }
 
-// FindPython locates the Python interpreter using the fallback order:
+// VenvInfo describes the Python environment the app resolved at startup.
+// Editable reflects whether the venv root is writable — false for read-only
+// installs. EnvService consults this before allowing install/uninstall.
+type VenvInfo struct {
+	Root     string // venv root directory (parent of Scripts/ or bin/)
+	Python   string // absolute path to the Python interpreter
+	Editable bool
+}
+
+// FindVenv locates the Python venv using the fallback order:
 // 1. .venv/ relative to CWD — dev mode (running from project root)
 // 2. .venv/ relative to executable — dev mode (binary in bin/ subdirectory)
 // 3. python/ relative to executable — distribution mode (bundled interpreter)
-func FindPython() (string, error) {
-	var venvRel string
+//
+// Returns the venv root and interpreter path. EnvService and the process
+// manager share this resolver so both operate on the same Python.
+func FindVenv() (VenvInfo, error) {
+	var pythonRel string
 	if runtime.GOOS == "windows" {
-		venvRel = filepath.Join(".venv", "Scripts", "python.exe")
+		pythonRel = filepath.Join("Scripts", "python.exe")
 	} else {
-		venvRel = filepath.Join(".venv", "bin", "python3")
+		pythonRel = filepath.Join("bin", "python3")
 	}
 
-	// Dev mode: venv relative to CWD
-	if _, err := os.Stat(venvRel); err == nil {
-		if abs, err := filepath.Abs(venvRel); err == nil {
-			return abs, nil
+	// Dev mode: .venv relative to CWD.
+	if root, err := filepath.Abs(".venv"); err == nil {
+		if _, err := os.Stat(filepath.Join(root, pythonRel)); err == nil {
+			return VenvInfo{Root: root, Python: filepath.Join(root, pythonRel), Editable: isWritable(root)}, nil
 		}
 	}
 
-	execPath, err := os.Executable()
-	if err == nil {
+	if execPath, err := os.Executable(); err == nil {
 		execDir := filepath.Dir(execPath)
 
-		// Dev mode: venv relative to executable's parent (e.g., bin/ -> project root)
-		venvFromExec := filepath.Join(execDir, "..", venvRel)
-		if _, err := os.Stat(venvFromExec); err == nil {
-			if abs, err := filepath.Abs(venvFromExec); err == nil {
-				return abs, nil
+		// Dev mode: .venv relative to executable's parent.
+		if root, err := filepath.Abs(filepath.Join(execDir, "..", ".venv")); err == nil {
+			if _, err := os.Stat(filepath.Join(root, pythonRel)); err == nil {
+				return VenvInfo{Root: root, Python: filepath.Join(root, pythonRel), Editable: isWritable(root)}, nil
 			}
 		}
 
-		// Distribution mode: bundled python next to executable
-		var bundledPython string
-		if runtime.GOOS == "windows" {
-			bundledPython = filepath.Join(execDir, "python", "python.exe")
-		} else {
-			bundledPython = filepath.Join(execDir, "python", "bin", "python3")
-		}
-		if _, err := os.Stat(bundledPython); err == nil {
-			return bundledPython, nil
+		// Distribution mode: bundled python next to executable.
+		bundled := filepath.Join(execDir, "python")
+		if _, err := os.Stat(filepath.Join(bundled, pythonRel)); err == nil {
+			return VenvInfo{Root: bundled, Python: filepath.Join(bundled, pythonRel), Editable: isWritable(bundled)}, nil
 		}
 	}
 
-	return "", fmt.Errorf("python not found: checked .venv/ and python/ directories")
+	return VenvInfo{}, fmt.Errorf("python not found: checked .venv/ and python/ directories")
+}
+
+// FindPython is the legacy wrapper. New code should call FindVenv directly so
+// it has access to the venv root and editability.
+func FindPython() (string, error) {
+	v, err := FindVenv()
+	if err != nil {
+		return "", err
+	}
+	return v.Python, nil
+}
+
+// isWritable returns true if the directory accepts new files. Used to gate
+// EnvService install/uninstall on the read-only-install case.
+func isWritable(dir string) bool {
+	tmp, err := os.CreateTemp(dir, ".write-probe-*")
+	if err != nil {
+		return false
+	}
+	name := tmp.Name()
+	_ = tmp.Close()
+	_ = os.Remove(name)
+	return true
 }

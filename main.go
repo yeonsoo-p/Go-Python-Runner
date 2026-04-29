@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"log"
 	"log/slog"
@@ -53,16 +54,22 @@ func main() {
 	// Initialize script registry
 	reg := registry.New(logger)
 	scriptsDir := findScriptsDir()
+	pluginDir := registry.DefaultPluginDir()
+	// Best-effort: ensure the plugin dir exists so the watcher can attach.
+	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
+		logger.Warn("could not create plugin dir", "dir", pluginDir, "error", err.Error(), "source", "backend")
+	}
 	if err := reg.LoadBuiltin(scriptsDir); err != nil {
 		logger.Warn("failed to load builtin scripts", "error", err.Error())
 	}
-	if err := reg.LoadPlugins(registry.DefaultPluginDir()); err != nil {
+	if err := reg.LoadPlugins(pluginDir); err != nil {
 		logger.Warn("failed to load plugin scripts", "error", err.Error())
 	}
 	logger.Info("scripts loaded",
 		"count", len(reg.List()),
 		"scriptsDir", scriptsDir,
 		"pluginDir", reg.PluginDir(),
+		"issues", len(reg.Issues()),
 		"source", "backend",
 	)
 
@@ -89,19 +96,30 @@ func main() {
 	mgr.LibDir = filepath.Join(scriptsDir, "_lib")
 
 	// Create Wails services
-	scriptSvc := services.NewScriptService(reg)
+	scriptSvc := services.NewScriptService(reg, logger, scriptsDir, pluginDir)
 	runnerSvc := services.NewRunnerService(mgr, reg, logger)
 	logSvc := services.NewLogService(logger, ring)
+	envSvc, envErr := services.NewEnvService(logger)
+	if envErr != nil {
+		// Non-fatal: env management UI is hidden if no venv resolved.
+		// Scripts still run via the Manager's own Python resolution.
+		logger.Warn("env service unavailable, environment pane disabled",
+			"error", envErr.Error(), "source", "backend")
+	}
 
 	// Create Wails application
+	wailsServices := []application.Service{
+		application.NewService(scriptSvc),
+		application.NewService(runnerSvc),
+		application.NewService(logSvc),
+	}
+	if envSvc != nil {
+		wailsServices = append(wailsServices, application.NewService(envSvc))
+	}
 	app := application.New(application.Options{
 		Name:        "Go Python Runner",
 		Description: "Orchestrates bundled Python scripts through a Go backend",
-		Services: []application.Service{
-			application.NewService(scriptSvc),
-			application.NewService(runnerSvc),
-			application.NewService(logSvc),
-		},
+		Services:    wailsServices,
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
 		},
@@ -110,7 +128,22 @@ func main() {
 	// Give services and gRPC server access to the app
 	runnerSvc.SetApp(app)
 	logSvc.SetApp(app)
+	scriptSvc.SetApp(app)
+	if envSvc != nil {
+		envSvc.SetApp(app)
+	}
 	grpcServer.SetDialogHandler(&wailsDialogHandler{app: app})
+
+	// Start filesystem watcher: rescans on changes, notifies frontend via
+	// scriptSvc.NotifyChanged → scripts:changed Wails event.
+	watcherCtx, cancelWatcher := context.WithCancel(context.Background())
+	defer cancelWatcher()
+	watcher := registry.NewWatcher(reg, scriptsDir, pluginDir, scriptSvc.NotifyChanged, logger)
+	go func() {
+		if err := watcher.Run(watcherCtx); err != nil {
+			logger.Error("script watcher exited with error", "error", err.Error(), "source", "backend")
+		}
+	}()
 
 	// Create main window
 	app.Window.NewWithOptions(application.WebviewWindowOptions{

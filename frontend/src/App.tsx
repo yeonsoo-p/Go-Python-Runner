@@ -2,6 +2,7 @@ import { Component, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import TaskGrid from './components/TaskGrid'
 import LogViewer from './components/LogViewer'
+import EnvironmentPane from './components/EnvironmentPane'
 import NotificationStack from './components/NotificationStack'
 import { NotificationsProvider } from './hooks/useNotifications'
 
@@ -45,7 +46,10 @@ class ErrorBoundary extends Component<
   }
 }
 
+type Tab = 'tasks' | 'environment'
+
 function App() {
+  const [tab, setTab] = useState<Tab>('tasks')
   const [showLogs, setShowLogs] = useState(false)
 
   // Tier guide (Frontend "shows", Go "manages"):
@@ -57,7 +61,13 @@ function App() {
       <NotificationsProvider>
         <div className="min-h-screen bg-slate-900 text-slate-200">
           <header className="border-b border-slate-700 px-6 py-4 flex items-center justify-between">
-            <h1 className="text-xl font-bold">Go Python Runner</h1>
+            <div className="flex items-center gap-6">
+              <h1 className="text-xl font-bold">Go Python Runner</h1>
+              <nav className="flex gap-1 text-sm">
+                <TabButton active={tab === 'tasks'} onClick={() => setTab('tasks')}>Tasks</TabButton>
+                <TabButton active={tab === 'environment'} onClick={() => setTab('environment')}>Environment</TabButton>
+              </nav>
+            </div>
             <button
               onClick={() => setShowLogs(!showLogs)}
               className="px-3 py-1 text-sm rounded bg-slate-700 hover:bg-slate-600 transition"
@@ -67,7 +77,8 @@ function App() {
           </header>
 
           <main className="p-6">
-            <TaskGrid />
+            {tab === 'tasks' && <TaskGrid />}
+            {tab === 'environment' && <EnvironmentPane />}
           </main>
 
           {showLogs && (
@@ -79,6 +90,17 @@ function App() {
         <NotificationStack />
       </NotificationsProvider>
     </ErrorBoundary>
+  )
+}
+
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-3 py-1 rounded transition ${active ? 'bg-slate-700 text-white' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+    >
+      {children}
+    </button>
   )
 }
 

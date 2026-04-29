@@ -1,9 +1,11 @@
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import { useScripts } from '../hooks/useScripts'
 import TaskCard from './TaskCard'
+import LoadIssuesBanner from './LoadIssuesBanner'
 
 function TaskGrid() {
-  const { scripts, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun } = useScripts()
+  const { scripts, issues, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun } = useScripts()
+  const [issuesExpanded, setIssuesExpanded] = useState(false)
 
   const handleStartRun = useCallback(async (scriptID: string, params: Record<string, string>, workerCount?: number) => {
     if (workerCount && workerCount > 1) {
@@ -31,14 +33,6 @@ function TaskGrid() {
     )
   }
 
-  if (scripts.length === 0) {
-    return (
-      <div className="flex items-center justify-center h-64 text-slate-400">
-        No scripts found.
-      </div>
-    )
-  }
-
   return (
     <div className="space-y-4">
       {/* Persistent tier: live updates broken, app still usable. */}
@@ -47,22 +41,36 @@ function TaskGrid() {
           Live updates unavailable. Script output may not refresh in real time — reload the app to retry.
         </div>
       )}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {scripts.map((script) => {
-          const scriptRuns = Array.from(runs.values()).filter(
-            (r) => r.scriptID === script.id
-          )
-          return (
-            <TaskCard
-              key={script.id}
-              script={script}
-              runs={scriptRuns}
-              onStartRun={handleStartRun}
-              onCancelRun={cancelRun}
-            />
-          )
-        })}
-      </div>
+      {/* Persistent tier: one or more plugin scripts failed to load. */}
+      {issues.length > 0 && (
+        <LoadIssuesBanner
+          issues={issues}
+          expanded={issuesExpanded}
+          onToggleExpanded={() => setIssuesExpanded(v => !v)}
+        />
+      )}
+      {scripts.length === 0 ? (
+        <div className="flex items-center justify-center h-64 text-slate-400">
+          No scripts found.
+        </div>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {scripts.map((script) => {
+            const scriptRuns = Array.from(runs.values()).filter(
+              (r) => r.scriptID === script.id
+            )
+            return (
+              <TaskCard
+                key={script.id}
+                script={script}
+                runs={scriptRuns}
+                onStartRun={handleStartRun}
+                onCancelRun={cancelRun}
+              />
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

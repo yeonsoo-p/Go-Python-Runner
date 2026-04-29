@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
 
 // Import generated types from Wails bindings
-import type { Script, Param } from '../../bindings/go-python-runner/internal/registry/models'
+import type { Script, Param, LoadIssue } from '../../bindings/go-python-runner/internal/registry/models'
 import { useNotifications } from './useNotifications'
 
-export type { Script, Param }
+export type { Script, Param, LoadIssue }
 
 export type RunStatus = 'running' | 'completed' | 'failed'
 
@@ -26,35 +26,65 @@ interface DataEvent { runID: string; scriptID: string; key: string; value: strin
 
 export function useScripts() {
   const [scripts, setScripts] = useState<Script[]>([])
+  const [issues, setIssues] = useState<LoadIssue[]>([])
   const [runs, setRuns] = useState<Map<string, RunState>>(new Map())
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [liveUpdatesAvailable, setLiveUpdatesAvailable] = useState(true)
   const { addNotification } = useNotifications()
 
-  useEffect(() => {
-    async function load() {
+  // loadCatalog fetches both scripts and issues. Called once on mount and
+  // again whenever the backend emits scripts:changed (filesystem watcher
+  // detected an add/remove/edit).
+  const loadCatalog = useCallback(async () => {
+    try {
+      const bindings = await import('../../bindings/go-python-runner/internal/services')
+      const [nextScripts, nextIssues] = await Promise.all([
+        bindings.ScriptService?.ListScripts?.() ?? Promise.resolve([]),
+        bindings.ScriptService?.ListIssues?.() ?? Promise.resolve([]),
+      ])
+      setScripts(nextScripts || [])
+      setIssues(nextIssues || [])
+      setLoadError(null)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Catastrophic: app cannot function without scripts. Surface inline,
+      // not as a toast — user needs to see this prominently.
+      setLoadError(`Failed to load scripts: ${msg}`)
       try {
-        const bindings = await import('../../bindings/go-python-runner/internal/services')
-        if (bindings.ScriptService?.ListScripts) {
-          const result = await bindings.ScriptService.ListScripts()
-          setScripts(result || [])
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
-        // Catastrophic: app cannot function without scripts. Surface inline,
-        // not as a toast — user needs to see this prominently.
-        setLoadError(`Failed to load scripts: ${msg}`)
-        try {
-          const svc = await import('../../bindings/go-python-runner/internal/services')
-          svc.LogService?.LogError?.('frontend', `Failed to load scripts: ${msg}`, {})
-        } catch { /* bindings not available */ }
-      } finally {
-        setLoading(false)
-      }
+        const svc = await import('../../bindings/go-python-runner/internal/services')
+        svc.LogService?.LogError?.('frontend', `Failed to load scripts: ${msg}`, {})
+      } catch { /* bindings not available */ }
     }
-    load()
   }, [])
+
+  useEffect(() => {
+    void (async () => {
+      await loadCatalog()
+      setLoading(false)
+    })()
+  }, [loadCatalog])
+
+  // Hot reload: when Go's filesystem watcher detects a change, re-fetch
+  // the catalog. Pure invalidation — the event carries no payload.
+  useEffect(() => {
+    let unsub: (() => void) | null = null
+    let aborted = false
+    void (async () => {
+      try {
+        const { Events } = await import('@wailsio/runtime')
+        if (aborted) return
+        unsub = Events.On('scripts:changed', () => { void loadCatalog() })
+      } catch {
+        // If Wails events fail here, the persistent banner is already raised
+        // by the run-events useEffect below; no separate signal needed.
+      }
+    })()
+    return () => {
+      aborted = true
+      if (unsub) unsub()
+    }
+  }, [loadCatalog])
 
   useEffect(() => {
     let cleanup: (() => void)[] = []
@@ -206,5 +236,5 @@ export function useScripts() {
     }
   }, [reportTransient])
 
-  return { scripts, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun }
+  return { scripts, issues, runs, loading, loadError, liveUpdatesAvailable, startRun, startParallelRuns, cancelRun }
 }

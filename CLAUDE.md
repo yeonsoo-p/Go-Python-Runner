@@ -17,6 +17,8 @@ A native desktop application that orchestrates bundled Python scripts through a 
 11. **Plugin system**: User-writable script directory that can override built-in scripts or add new ones post-build
 12. **Testing**: Three tiers — unit tests (isolated, fast), service tests (real deps, no full app), integration tests (end-to-end Go-Python)
 13. **Shared cache**: Parallel scripts share any Python object via `multiprocessing.shared_memory` + pickle. Go manages lifecycle (registry, ref counting, cleanup).
+14. **Error handling**: Every failure surfaces durably (slog) AND visibly (toast/banner/streamed pane). Hard rule, no exceptions. See § Error Handling for the four-part contract.
+15. **Plugin authoring loop**: Catalog hot-reloads on filesystem changes via fsnotify; malformed plugins surface as `LoadIssue` records, not silent skips. Scripts can be opened in the OS default handler from the UI.
 
 ## Architecture Layers
 
@@ -277,6 +279,132 @@ Using `slog` levels: DEBUG, INFO, WARN, ERROR.
 - Filters by source (frontend/backend/python), level, scriptID, runID
 - Real-time updates via `log:entry` Wails event
 - Collapsible traceback display for Python errors
+
+## Error Handling
+
+**Every failure must surface. No silent failures, no log-only failures, no toast-only failures. This is a hard rule. PRs that violate it should not pass review.**
+
+### The four-part contract
+
+For every operation that can fail:
+
+1. **Return the error.** Functions that can fail return `error` (Go) or reject the Promise (TS). Discarding with `_ =` or empty `catch {}` is forbidden.
+2. **Record durably.** Every error reaches `slog.Error(...)` exactly once, at the layer that owns the failure. LogViewer is the debugging archive — if it's not there, future-you can't investigate.
+3. **Surface to the user.** Every error reaches at least one user-visible surface chosen by the persistence × severity matrix below.
+4. **Don't leave torn state.** If the failure happened mid-operation, recover or roll back before returning. Half-applied state is worse than a clean rollback.
+
+### Three orthogonal axes (not a hierarchy)
+
+`LoadIssue`, returned errors, and `slog.Warn`/`slog.Error` are three different axes that *coordinate* but don't subsume each other:
+
+| Axis | Question it answers |
+| --- | --- |
+| **Severity** (info / warn / error) | *How bad?* |
+| **Persistence** (one-shot vs ongoing vs in-flight) | *Does the user need to take action that persists across renders?* |
+| **Surface** (log / toast / banner / streamed pane) | *Where does the user see it?* |
+
+Surface is **determined by** persistence × severity:
+
+| Persistence | Severity | Surface |
+| --- | --- | --- |
+| Ongoing | error/warn | **Banner** + `slog.Warn`/`Error` to log |
+| One-shot | error | **Toast** + `slog.Error` to log |
+| One-shot | warn/info | `slog.Warn`/`Info` to log only (no toast — would be noisy) |
+| In-flight | varies | **Streamed log pane** + final toast on terminal error |
+| Catastrophic | error | **Full-screen retry pane** + `slog.Error` to log |
+
+A single logical event can produce records on multiple surfaces because they answer different questions. A malformed `script.json` produces a `LoadIssue` (banner row) AND a `slog.Warn` (durable record). A failed `InstallPackage` produces a toast (one-shot) AND streamed pip output (in-flight) AND a `slog.Error`. Don't pick one and skip the others.
+
+### Forbidden patterns
+
+| Anti-pattern | Why forbidden |
+| --- | --- |
+| `_ = mgr.CancelRun(id)` | Discarded errors. If you genuinely don't care, comment why and use `//nolint:errcheck`. |
+| `slog.Error(...)` with no UI surface | Durable record without user signal — user retries thinking it didn't run. |
+| `addNotification({level:'error',...})` with no `slog.Error` | Toast vanishes in 5s; tomorrow's bug report has no trace. |
+| `try { ... } catch { return null }` | Silent swallow; downstream can't tell "no data" from "broken." |
+| Returning success with `slog.Warn("partial failure")` | If part failed, the operation failed. Period. |
+| Default-to-fallback values on error | Hides failures. The caller can decide on a fallback if they want one. |
+
+### Templates
+
+Wails-bound method:
+
+```go
+func (s *FooService) DoThing(arg string) error {
+    if err := s.validate(arg); err != nil {
+        s.logger.Error("validate failed", "arg", arg, "error", err.Error(), "source", "backend")
+        return fmt.Errorf("validate %q: %w", arg, err)
+    }
+    if err := s.execute(arg); err != nil {
+        s.logger.Error("execute failed", "arg", arg, "error", err.Error(), "source", "backend")
+        return fmt.Errorf("execute %q: %w", arg, err)
+    }
+    s.logger.Info("doThing succeeded", "arg", arg, "source", "backend")
+    return nil
+}
+```
+
+Frontend caller:
+
+```ts
+try {
+  await bindings.FooService.DoThing(arg)
+} catch (e) {
+  const msg = e instanceof Error ? e.message : String(e)
+  addNotification({ level: 'error', message: `Failed to do thing: ${msg}` })
+  // Go already logged via slog; no need for LogService.LogError here.
+}
+```
+
+Background goroutine:
+
+```go
+go func() {
+    if err := s.longRun(...); err != nil {
+        s.logger.Error("longRun failed", "error", err.Error(), "source", "backend")
+        if app := s.app.Load(); app != nil {
+            app.Event.Emit("foo:error", map[string]string{"message": err.Error()})
+        }
+        return
+    }
+    if app := s.app.Load(); app != nil {
+        app.Event.Emit("foo:done", nil)
+    }
+}()
+```
+
+### Cascading failures: `errors.Join`, not exceptions
+
+When a primary operation fails and rollback fires, the rollback itself may partially fail. Don't carve out an exception ("user already saw the primary failure"). Use `errors.Join` so all errors propagate:
+
+```go
+runIDs, primaryErr := s.startAll(...)
+if primaryErr != nil {
+    var cleanup []error
+    for _, id := range runIDs {
+        if cancelErr := s.manager.CancelRun(id); cancelErr != nil {
+            s.logger.Error("rollback cancel failed", "runID", id, "error", cancelErr.Error(), "source", "backend")
+            cleanup = append(cleanup, fmt.Errorf("rollback %s: %w", id, cancelErr))
+        }
+    }
+    s.logger.Error("StartParallelRuns failed", "error", primaryErr.Error(), "source", "backend")
+    return nil, errors.Join(primaryErr, errors.Join(cleanup...))
+}
+```
+
+Every error is durably logged at its layer; the joined error becomes one toast on the frontend. No exemption, no carve-out.
+
+### Tests must enforce
+
+Every new method gets at least one negative test asserting all four parts of the contract:
+
+- Method returns a non-nil error when its dep fails.
+- `slog.Error` is captured (use a test `slog.Handler` that records entries — see `internal/services/log_service_test.go`).
+- The user-visible surface is reached (frontend test: mock the binding to throw, assert toast appears via `useNotifications`).
+- Internal state remains coherent.
+
+The four assertions are the four parts of the contract. If a test asserts only "method returned an error," it's incomplete.
 
 ## Python Script Structure
 
