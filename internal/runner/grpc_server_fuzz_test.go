@@ -136,9 +136,9 @@ func buildClientMessage(variant uint8, s1, s2 string, i1, i2 int32, b []byte) *p
 	case 4:
 		msg.Msg = &pb.ClientMessage_Data{Data: &pb.DataResult{Key: s1, Value: b}}
 	case 5:
-		msg.Msg = &pb.ClientMessage_CacheCreate{CacheCreate: &pb.CacheCreate{Key: s1, ShmName: s2, Size: int64(i1)}}
+		msg.Msg = &pb.ClientMessage_CacheCreate{CacheCreate: &pb.CacheCreateRequest{Key: s1, ShmName: s2, Size: int64(i1)}}
 	case 6:
-		msg.Msg = &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookup{Key: s1}}
+		msg.Msg = &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookupRequest{Key: s1}}
 	case 7:
 		msg.Msg = &pb.ClientMessage_CacheRelease{CacheRelease: &pb.CacheRelease{Key: s1}}
 	case 8:

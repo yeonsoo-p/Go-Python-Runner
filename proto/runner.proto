@@ -6,34 +6,46 @@ service PythonRunner {
   rpc Execute(stream ClientMessage) returns (stream ServerMessage);
 }
 
+// Naming convention:
+//   - Events (fire-and-forget, no reply expected): bare nouns
+//     (Output, Progress, Status, Error, DataResult, CacheRelease).
+//   - Synchronous request/response pairs: `*Request` and `*Response` types.
+//     The Python helper holds `_request_lock` across send+recv so responses
+//     are delivered to the issuing thread in stream order.
+
 // ClientMessage: sent by Python (gRPC client) to Go (gRPC server).
-// Python scripts report their output, progress, status, errors, cache ops, and dialog requests.
 message ClientMessage {
   oneof msg {
+    // Events — Go consumes, no reply.
     Output output = 1;
     Progress progress = 2;
     Status status = 3;
     Error error = 4;
     DataResult data = 5;
-    CacheCreate cache_create = 6;
-    CacheLookup cache_lookup = 7;
     CacheRelease cache_release = 8;
+
+    // Synchronous requests — Go replies via ServerMessage.
+    CacheCreateRequest cache_create = 6;
+    CacheLookupRequest cache_lookup = 7;
     FileDialogRequest file_dialog = 9;
-    DbExecute db_execute = 10;
-    DbQuery db_query = 11;
+    DbExecuteRequest db_execute = 10;
+    DbQueryRequest db_query = 11;
   }
 }
 
 // ServerMessage: sent by Go (gRPC server) to Python (gRPC client).
-// Go sends start params, cancel signals, cache lookup responses, and dialog results.
 message ServerMessage {
   oneof msg {
+    // Imperative messages — Python consumes, no reply.
     StartRequest start = 1;
     CancelRequest cancel = 2;
-    CacheInfo cache_info = 3;
+
+    // Responses paired with ClientMessage requests.
+    CacheCreateResponse cache_create_response = 3;
     FileDialogResponse file_dialog_response = 4;
-    DbResult db_result = 5;
-    DbQueryResult db_query_result = 6;
+    DbExecuteResponse db_execute_response = 5;
+    DbQueryResponse db_query_response = 6;
+    CacheLookupResponse cache_lookup_response = 7;
   }
 }
 
@@ -65,8 +77,10 @@ message Status {
 
 // Severity classifies a structured notification from any source (Python, Go,
 // frontend). The reservoir maps this onto a UI surface via persistence axis.
-// SEVERITY_UNSPECIFIED is treated as SEVERITY_ERROR for back-compat with
-// scripts predating the field.
+//
+// SEVERITY_UNSPECIFIED is a programming bug — every send site must set the
+// field explicitly (Python's runner.fail/warn/info always do). Receivers map
+// it to SEVERITY_ERROR so the bug fails loudly rather than silently.
 enum Severity {
   SEVERITY_UNSPECIFIED = 0;
   SEVERITY_INFO        = 1;
@@ -86,31 +100,64 @@ message DataResult {
   bytes value = 2;
 }
 
-message CacheCreate {
+// --- Cache messages ---
+
+// CacheCreateRequest — Python registers a freshly created shm block with Go.
+// Reply: CacheCreateResponse. Synchronous: Python blocks until acked, so a
+// duplicate-key rejection causes cache_set to raise before the script
+// proceeds with a stale assumption that its data was shared.
+message CacheCreateRequest {
   string key = 1;
   int64 size = 2;
   string shm_name = 3;
 }
 
-message CacheLookup {
+message CacheCreateResponse {
+  string key = 1;
+  CacheCreateError error_code = 2;
+  // Human-readable detail. Empty when error_code == CACHE_CREATE_OK.
+  string error_message = 3;
+}
+
+enum CacheCreateError {
+  CACHE_CREATE_OK = 0;
+  // Key already registered by an earlier cache_create. Overwriting would
+  // orphan the prior shm and silently drop other runs' refs, so Go rejects.
+  CACHE_CREATE_DUPLICATE_KEY = 1;
+  // Catch-all for unexpected server-side failures. Inspect error_message.
+  CACHE_CREATE_INTERNAL = 2;
+}
+
+// CacheLookupRequest — Python asks Go to resolve a key to a shm block.
+// Reply: CacheLookupResponse. Adds the calling run as a referencer.
+message CacheLookupRequest {
   string key = 1;
 }
 
-message CacheInfo {
+message CacheLookupResponse {
   string key = 1;
-  string shm_name = 2;
-  int64 size = 3;
-  bool found = 4;
-  string error = 5;
+  bool found = 2;
+  string shm_name = 3;
+  int64 size = 4;
 }
 
+// CacheRelease — fire-and-forget. Go drops one ref for this runID; if none
+// remain, the block is unlinked. No reply: a stale "key not found" release
+// is logged Warn+OneShot on the Go side and surfaces only in the LogViewer.
 message CacheRelease {
   string key = 1;
 }
 
-// File dialog messages — Python requests a native OS dialog via Go/Wails.
+// --- File dialog messages ---
+
+enum DialogKind {
+  DIALOG_KIND_UNSPECIFIED = 0;
+  DIALOG_KIND_OPEN = 1;
+  DIALOG_KIND_SAVE = 2;
+}
+
 message FileDialogRequest {
-  string type = 1;             // "open" or "save"
+  DialogKind kind = 1;
   string title = 2;
   repeated FileFilter filters = 3;
   string directory = 4;        // initial directory
@@ -123,23 +170,33 @@ message FileFilter {
 }
 
 message FileDialogResponse {
-  repeated string paths = 1;   // selected path(s); empty if cancelled
-  bool cancelled = 2;
-  string error = 3;            // non-empty if dialog failed (vs user cancelled)
+  // Exactly one outcome is set. Cancellation is a user choice (silent on
+  // Go side); error is an OS-level dialog failure (Go reports it to the
+  // reservoir before sending).
+  oneof outcome {
+    SelectedPaths selected = 1;
+    bool cancelled = 2;        // value is always true; presence is the signal
+    string error = 3;          // non-empty: dialog implementation failed
+  }
 }
 
-// Database messages — Python scripts execute SQL against Go's SQLite database.
-message DbExecute {
+message SelectedPaths {
+  repeated string paths = 1;
+}
+
+// --- Database messages ---
+
+message DbExecuteRequest {
   string sql = 1;
   repeated string params = 2;  // positional ? placeholders
 }
 
-message DbQuery {
+message DbQueryRequest {
   string sql = 1;
   repeated string params = 2;  // positional ? placeholders
 }
 
-message DbResult {
+message DbExecuteResponse {
   int64 rows_affected = 1;
   int64 last_insert_id = 2;
   string error = 3;            // empty = success
@@ -149,7 +206,7 @@ message DbRow {
   repeated string values = 1;  // all values as strings; NULL -> ""
 }
 
-message DbQueryResult {
+message DbQueryResponse {
   repeated string columns = 1;
   repeated DbRow rows = 2;
   string error = 3;            // empty = success

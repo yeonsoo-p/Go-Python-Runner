@@ -345,10 +345,11 @@ def cache_set(key: str, obj: object) -> None:
     while the producer is still alive. ``_cleanup_cache`` and Go provide the
     backstop unlink for owned keys.
 
-    Synchronous: blocks on Go's CacheInfo ack. Go rejects when the key is
-    already registered (overwriting would orphan the prior block and silently
-    drop every other run's ref). On rejection we close+unlink our just-created
-    shm and raise — the script must learn that its data isn't actually shared.
+    Synchronous: blocks on Go's CacheCreateResponse ack. Go rejects when the
+    key is already registered (overwriting would orphan the prior block and
+    silently drop every other run's ref). On rejection we close+unlink our
+    just-created shm and raise — the script must learn that its data isn't
+    actually shared.
     """
     if _stream is None:
         raise RuntimeError("not connected — call connect() first")
@@ -364,7 +365,7 @@ def cache_set(key: str, obj: object) -> None:
         with _request_lock:
             _send(
                 runner_pb2.ClientMessage(
-                    cache_create=runner_pb2.CacheCreate(
+                    cache_create=runner_pb2.CacheCreateRequest(
                         key=str(key),
                         size=len(data),
                         shm_name=shm.name,
@@ -375,12 +376,13 @@ def cache_set(key: str, obj: object) -> None:
                 resp = _recv_response("cache create")
             except grpc.RpcError as e:
                 raise RuntimeError(f"Lost connection while waiting for cache create ack: {e}") from e
-            if not resp.HasField("cache_info"):
-                raise RuntimeError(f"Expected CacheInfo response to cache_create, got {resp}")
+            if not resp.HasField("cache_create_response"):
+                raise RuntimeError(f"Expected CacheCreateResponse response to cache_create, got {resp}")
 
-        info = resp.cache_info
-        if info.error:
-            raise RuntimeError(f"cache_set rejected: {info.error}")
+        ack = resp.cache_create_response
+        if ack.error_code != runner_pb2.CACHE_CREATE_OK:
+            detail = ack.error_message or runner_pb2.CacheCreateError.Name(ack.error_code)
+            raise RuntimeError(f"cache_set rejected: {detail}")
         registered = True
     finally:
         if not registered:
@@ -400,16 +402,16 @@ def cache_get(key: str) -> object:
 
     # Lock ensures no other thread can interleave its own send+recv on the shared stream.
     with _request_lock:
-        _send(runner_pb2.ClientMessage(cache_lookup=runner_pb2.CacheLookup(key=str(key))))
+        _send(runner_pb2.ClientMessage(cache_lookup=runner_pb2.CacheLookupRequest(key=str(key))))
 
         try:
             resp = _recv_response("cache lookup")
         except grpc.RpcError as e:
-            raise RuntimeError(f"Lost connection while waiting for cache info: {e}") from e
-        if not resp.HasField("cache_info"):
-            raise RuntimeError(f"Expected CacheInfo response, got {resp}")
+            raise RuntimeError(f"Lost connection while waiting for cache lookup: {e}") from e
+        if not resp.HasField("cache_lookup_response"):
+            raise RuntimeError(f"Expected CacheLookupResponse, got {resp}")
 
-        info = resp.cache_info
+        info = resp.cache_lookup_response
         if not info.found:
             raise KeyError(f"Cache key not found: {key}")
 
@@ -444,6 +446,25 @@ def cache_release(key: str) -> None:
 # --- File Dialog API ---
 
 
+def _unwrap_dialog_response(resp: Any) -> str | None:
+    """Map a FileDialogResponse oneof outcome to the dialog API's return shape.
+
+    Selected → first path. Cancelled → None. Error → raise RuntimeError (Go has
+    already reported it via reservoir.Report; the raise is local control flow
+    so callers can branch on success vs. OS failure).
+    """
+    outcome = resp.WhichOneof("outcome")
+    if outcome == "selected":
+        paths = resp.selected.paths
+        return str(paths[0]) if paths else None
+    if outcome == "cancelled":
+        return None
+    if outcome == "error":
+        raise RuntimeError(f"File dialog error: {resp.error}")
+    # No outcome set is treated as cancelled — defensive against schema drift.
+    return None
+
+
 def dialog_open(
     title: str = "",
     directory: str = "",
@@ -467,7 +488,7 @@ def dialog_open(
         _send(
             runner_pb2.ClientMessage(
                 file_dialog=runner_pb2.FileDialogRequest(
-                    type="open",
+                    kind=runner_pb2.DIALOG_KIND_OPEN,
                     title=title,
                     directory=directory,
                     filters=proto_filters,
@@ -480,11 +501,7 @@ def dialog_open(
             raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
         if not resp.HasField("file_dialog_response"):
             raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
-    if resp.file_dialog_response.error:
-        raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
-    if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
-        return None
-    return str(resp.file_dialog_response.paths[0])
+    return _unwrap_dialog_response(resp.file_dialog_response)
 
 
 def dialog_save(
@@ -512,7 +529,7 @@ def dialog_save(
         _send(
             runner_pb2.ClientMessage(
                 file_dialog=runner_pb2.FileDialogRequest(
-                    type="save",
+                    kind=runner_pb2.DIALOG_KIND_SAVE,
                     title=title,
                     directory=directory,
                     filename=filename,
@@ -526,11 +543,7 @@ def dialog_save(
             raise RuntimeError(f"Lost connection while waiting for file dialog response: {e}") from e
         if not resp.HasField("file_dialog_response"):
             raise RuntimeError(f"Expected FileDialogResponse, got {resp}")
-    if resp.file_dialog_response.error:
-        raise RuntimeError(f"File dialog error: {resp.file_dialog_response.error}")
-    if resp.file_dialog_response.cancelled or not resp.file_dialog_response.paths:
-        return None
-    return str(resp.file_dialog_response.paths[0])
+    return _unwrap_dialog_response(resp.file_dialog_response)
 
 
 # --- Database API ---
@@ -555,7 +568,7 @@ def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
     with _request_lock:
         _send(
             runner_pb2.ClientMessage(
-                db_execute=runner_pb2.DbExecute(
+                db_execute=runner_pb2.DbExecuteRequest(
                     sql=sql,
                     params=params or [],
                 )
@@ -565,16 +578,16 @@ def db_execute(sql: str, params: list[str] | None = None) -> dict[str, int]:
         try:
             resp = _recv_response("db execute")
         except grpc.RpcError as e:
-            raise RuntimeError(f"Lost connection while waiting for db result: {e}") from e
-        if not resp.HasField("db_result"):
-            raise RuntimeError(f"Expected DbResult response, got {resp}")
+            raise RuntimeError(f"Lost connection while waiting for db execute response: {e}") from e
+        if not resp.HasField("db_execute_response"):
+            raise RuntimeError(f"Expected DbExecuteResponse, got {resp}")
 
-    if resp.db_result.error:
-        raise RuntimeError(f"SQL error: {resp.db_result.error}")
+    if resp.db_execute_response.error:
+        raise RuntimeError(f"SQL error: {resp.db_execute_response.error}")
 
     return {
-        "rows_affected": resp.db_result.rows_affected,
-        "last_insert_id": resp.db_result.last_insert_id,
+        "rows_affected": resp.db_execute_response.rows_affected,
+        "last_insert_id": resp.db_execute_response.last_insert_id,
     }
 
 
@@ -597,7 +610,7 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
     with _request_lock:
         _send(
             runner_pb2.ClientMessage(
-                db_query=runner_pb2.DbQuery(
+                db_query=runner_pb2.DbQueryRequest(
                     sql=sql,
                     params=params or [],
                 )
@@ -607,15 +620,15 @@ def db_query(sql: str, params: list[str] | None = None) -> list[dict[str, str]]:
         try:
             resp = _recv_response("db query")
         except grpc.RpcError as e:
-            raise RuntimeError(f"Lost connection while waiting for db query result: {e}") from e
-        if not resp.HasField("db_query_result"):
-            raise RuntimeError(f"Expected DbQueryResult response, got {resp}")
+            raise RuntimeError(f"Lost connection while waiting for db query response: {e}") from e
+        if not resp.HasField("db_query_response"):
+            raise RuntimeError(f"Expected DbQueryResponse, got {resp}")
 
-    if resp.db_query_result.error:
-        raise RuntimeError(f"SQL error: {resp.db_query_result.error}")
+    if resp.db_query_response.error:
+        raise RuntimeError(f"SQL error: {resp.db_query_response.error}")
 
-    columns = list(resp.db_query_result.columns)
-    return [dict(zip(columns, row.values, strict=True)) for row in resp.db_query_result.rows]
+    columns = list(resp.db_query_response.columns)
+    return [dict(zip(columns, row.values, strict=True)) for row in resp.db_query_response.rows]
 
 
 def _cleanup_cache() -> None:

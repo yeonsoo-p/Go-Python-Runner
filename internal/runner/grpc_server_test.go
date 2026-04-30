@@ -208,7 +208,7 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 	// Register a cache block
 	err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_CacheCreate{
-			CacheCreate: &pb.CacheCreate{
+			CacheCreate: &pb.CacheCreateRequest{
 				Key:     "features",
 				Size:    4096,
 				ShmName: "shm_test_001",
@@ -225,11 +225,11 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ack := createAck.GetCacheInfo()
+	ack := createAck.GetCacheCreateResponse()
 	if ack == nil {
-		t.Fatal("expected CacheInfo ack for cache_create")
+		t.Fatal("expected CacheCreateResponse ack for cache_create")
 	}
-	if !ack.Found || ack.Error != "" || ack.ShmName != "shm_test_001" || ack.Size != 4096 {
+	if ack.ErrorCode != pb.CacheCreateError_CACHE_CREATE_OK || ack.ErrorMessage != "" || ack.Key != "features" {
 		t.Errorf("unexpected cache_create ack: %+v", ack)
 	}
 
@@ -237,7 +237,7 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 	// this lookup arrives (same stream, ordered delivery)
 	err = stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_CacheLookup{
-			CacheLookup: &pb.CacheLookup{Key: "features"},
+			CacheLookup: &pb.CacheLookupRequest{Key: "features"},
 		},
 	})
 	if err != nil {
@@ -249,18 +249,18 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := resp.GetCacheInfo()
+	info := resp.GetCacheLookupResponse()
 	if info == nil {
-		t.Fatal("expected CacheInfo response")
+		t.Fatal("expected CacheLookupResponse response")
 	}
 	if !info.Found || info.ShmName != "shm_test_001" || info.Size != 4096 {
-		t.Errorf("unexpected cache info: %+v", info)
+		t.Errorf("unexpected cache lookup: %+v", info)
 	}
 }
 
 // TestGRPCServer_CacheCreateRejectsDuplicate verifies the server rejects a
-// cache_create for an already-registered key by acking with a non-empty
-// CacheInfo.error, instead of silently overwriting the prior block.
+// cache_create for an already-registered key by setting a typed error code
+// in CacheCreateResponse, instead of silently overwriting the prior block.
 func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
 	srv, cleanup := testGRPCServer(t)
 	defer cleanup()
@@ -274,7 +274,7 @@ func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
 	// First registration succeeds.
 	if err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_CacheCreate{
-			CacheCreate: &pb.CacheCreate{Key: "k", Size: 100, ShmName: "shm_first"},
+			CacheCreate: &pb.CacheCreateRequest{Key: "k", Size: 100, ShmName: "shm_first"},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -283,14 +283,15 @@ func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ack := first.GetCacheInfo(); ack == nil || ack.Error != "" {
+	if ack := first.GetCacheCreateResponse(); ack == nil || ack.ErrorCode != pb.CacheCreateError_CACHE_CREATE_OK {
 		t.Fatalf("expected first cache_create to be acked clean, got %+v", ack)
 	}
 
-	// Second registration with the same key must be rejected.
+	// Second registration with the same key must be rejected with the
+	// duplicate-key error code.
 	if err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_CacheCreate{
-			CacheCreate: &pb.CacheCreate{Key: "k", Size: 200, ShmName: "shm_second"},
+			CacheCreate: &pb.CacheCreateRequest{Key: "k", Size: 200, ShmName: "shm_second"},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -299,15 +300,18 @@ func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rej := second.GetCacheInfo()
-	if rej == nil || rej.Error == "" {
-		t.Fatalf("expected duplicate cache_create to be rejected, got %+v", rej)
+	rej := second.GetCacheCreateResponse()
+	if rej == nil || rej.ErrorCode != pb.CacheCreateError_CACHE_CREATE_DUPLICATE_KEY {
+		t.Fatalf("expected duplicate cache_create to be rejected with DUPLICATE_KEY, got %+v", rej)
+	}
+	if rej.ErrorMessage == "" {
+		t.Errorf("expected error_message to carry human-readable detail, got empty")
 	}
 
 	// Original block must still resolve to the FIRST shm — the rejection
 	// must not have overwritten it.
 	if err := stream.Send(&pb.ClientMessage{
-		Msg: &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookup{Key: "k"}},
+		Msg: &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookupRequest{Key: "k"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +319,7 @@ func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := lookup.GetCacheInfo()
+	info := lookup.GetCacheLookupResponse()
 	if info == nil || info.ShmName != "shm_first" || info.Size != 100 {
 		t.Errorf("expected lookup to resolve to original block, got %+v", info)
 	}
@@ -457,7 +461,7 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	// CREATE TABLE via DbExecute
 	err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_DbExecute{
-			DbExecute: &pb.DbExecute{
+			DbExecute: &pb.DbExecuteRequest{
 				Sql: "CREATE TABLE test_items (id INTEGER PRIMARY KEY, name TEXT)",
 			},
 		},
@@ -470,9 +474,9 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := resp.GetDbResult()
+	result := resp.GetDbExecuteResponse()
 	if result == nil {
-		t.Fatal("expected DbResult response")
+		t.Fatal("expected DbExecuteResponse response")
 	}
 	if result.Error != "" {
 		t.Fatalf("unexpected error: %s", result.Error)
@@ -481,7 +485,7 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	// INSERT via DbExecute with params
 	err = stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_DbExecute{
-			DbExecute: &pb.DbExecute{
+			DbExecute: &pb.DbExecuteRequest{
 				Sql:    "INSERT INTO test_items (name) VALUES (?)",
 				Params: []string{"hello"},
 			},
@@ -495,9 +499,9 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result = resp.GetDbResult()
+	result = resp.GetDbExecuteResponse()
 	if result == nil {
-		t.Fatal("expected DbResult response")
+		t.Fatal("expected DbExecuteResponse response")
 	}
 	if result.Error != "" {
 		t.Fatalf("unexpected error: %s", result.Error)
@@ -509,7 +513,7 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	// SELECT via DbQuery
 	err = stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_DbQuery{
-			DbQuery: &pb.DbQuery{
+			DbQuery: &pb.DbQueryRequest{
 				Sql: "SELECT id, name FROM test_items",
 			},
 		},
@@ -522,9 +526,9 @@ func TestGRPCServer_DbExecuteAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qr := resp.GetDbQueryResult()
+	qr := resp.GetDbQueryResponse()
 	if qr == nil {
-		t.Fatal("expected DbQueryResult response")
+		t.Fatal("expected DbQueryResponse response")
 	}
 	if qr.Error != "" {
 		t.Fatalf("unexpected error: %s", qr.Error)
@@ -550,7 +554,7 @@ func TestGRPCServer_DbQueryError(t *testing.T) {
 	// Invalid SQL
 	err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_DbQuery{
-			DbQuery: &pb.DbQuery{
+			DbQuery: &pb.DbQueryRequest{
 				Sql: "SELECT * FROM nonexistent_table",
 			},
 		},
@@ -563,9 +567,9 @@ func TestGRPCServer_DbQueryError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qr := resp.GetDbQueryResult()
+	qr := resp.GetDbQueryResponse()
 	if qr == nil {
-		t.Fatal("expected DbQueryResult response")
+		t.Fatal("expected DbQueryResponse response")
 	}
 	if qr.Error == "" {
 		t.Error("expected error for invalid table, got empty string")
@@ -621,7 +625,7 @@ func TestGRPCServer_FileDialog_CancelDoesNotReport(t *testing.T) {
 
 	if err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_FileDialog{
-			FileDialog: &pb.FileDialogRequest{Type: "save", Title: "Cancelled"},
+			FileDialog: &pb.FileDialogRequest{Kind: pb.DialogKind_DIALOG_KIND_SAVE, Title: "Cancelled"},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -635,11 +639,8 @@ func TestGRPCServer_FileDialog_CancelDoesNotReport(t *testing.T) {
 	if r == nil {
 		t.Fatal("expected FileDialogResponse")
 	}
-	if !r.Cancelled {
-		t.Error("expected Cancelled=true on user cancel")
-	}
-	if r.Error != "" {
-		t.Errorf("expected empty Error on cancel, got %q", r.Error)
+	if _, ok := r.Outcome.(*pb.FileDialogResponse_Cancelled); !ok {
+		t.Errorf("expected Cancelled outcome on user cancel, got %T", r.Outcome)
 	}
 
 	for _, ev := range rec.Events() {
@@ -665,7 +666,7 @@ func TestGRPCServer_FileDialog_ErrorReports(t *testing.T) {
 
 	if err := stream.Send(&pb.ClientMessage{
 		Msg: &pb.ClientMessage_FileDialog{
-			FileDialog: &pb.FileDialogRequest{Type: "open", Title: "Real failure"},
+			FileDialog: &pb.FileDialogRequest{Kind: pb.DialogKind_DIALOG_KIND_OPEN, Title: "Real failure"},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -679,8 +680,9 @@ func TestGRPCServer_FileDialog_ErrorReports(t *testing.T) {
 	if r == nil {
 		t.Fatal("expected FileDialogResponse")
 	}
-	if r.Error == "" {
-		t.Error("expected non-empty Error on genuine OS failure")
+	errOutcome, ok := r.Outcome.(*pb.FileDialogResponse_Error)
+	if !ok || errOutcome.Error == "" {
+		t.Errorf("expected non-empty Error outcome on genuine OS failure, got %+v", r.Outcome)
 	}
 
 	errs := rec.FindBySeverity(notify.SeverityError)

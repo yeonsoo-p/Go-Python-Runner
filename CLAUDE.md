@@ -53,8 +53,10 @@ Single source of truth: `proto/runner.proto`. Both Go and Python use generated c
 
 One bidirectional streaming RPC (`Execute`). Message direction follows gRPC client/server roles:
 
-- **ClientMessage** (Python → Go): `Output`, `Progress`, `Status`, `Error`, `DataResult`, `CacheCreate`, `CacheLookup`, `CacheRelease`, `FileDialogRequest`, `DbExecute`, `DbQuery`
-- **ServerMessage** (Go → Python): `StartRequest` (with params map), `CancelRequest`, `CacheInfo`, `FileDialogResponse`, `DbResult`, `DbQueryResult`
+- **ClientMessage** (Python → Go): events `Output` / `Progress` / `Status` / `Error` / `DataResult` / `CacheRelease`; synchronous requests `CacheCreateRequest` / `CacheLookupRequest` / `FileDialogRequest` / `DbExecuteRequest` / `DbQueryRequest`
+- **ServerMessage** (Go → Python): imperatives `StartRequest` (with params map) / `CancelRequest`; responses `CacheCreateResponse` / `CacheLookupResponse` / `FileDialogResponse` / `DbExecuteResponse` / `DbQueryResponse`
+
+Naming convention: events stay bare nouns; synchronous request/response pairs use `*Request` / `*Response` suffixes. The Python helper holds `_request_lock` across send+recv so responses are delivered to the issuing thread in stream order. `CacheRelease` is fire-and-forget — no response.
 
 ## Wails v3 Services
 
@@ -514,15 +516,17 @@ Parallel Python scripts can share **any picklable Python object** (dicts, DataFr
 ```text
 Go Backend (Cache Manager)
 ├── Tracks named blocks: key -> {shm_name, size, owner_run, ref_count}
-├── gRPC messages: CacheCreate, CacheLookup, CacheRelease, CacheInfo
+├── gRPC requests: CacheCreateRequest, CacheLookupRequest, CacheRelease (fire-and-forget)
+├── gRPC responses: CacheCreateResponse (typed CacheCreateError), CacheLookupResponse
 └── Cleanup: releases blocks when all referencing runs complete
 
 Python Script A                         Python Script B
 ├── runner.cache_set("features", obj)   ├── runner.cache_get("features")
-│   1. pickle.dumps(obj)                │   1. gRPC CacheLookup -> shm_name + size
+│   1. pickle.dumps(obj)                │   1. CacheLookupRequest -> shm_name + size
 │   2. SharedMemory.create(size)        │   2. SharedMemory.open(shm_name)
 │   3. Write pickled bytes to block     │   3. pickle.loads(shm.buf) -> obj
-│   4. gRPC CacheCreate -> register     │   (shared memory, no Go intermediary)
+│   4. CacheCreateRequest -> ack         │   (shared memory, no Go intermediary)
+│      (rejected if key already exists) │
 └── Continues execution                 └── Continues execution
 ```
 
@@ -535,7 +539,7 @@ Python Script A                         Python Script B
 
 ### Python helper API (`scripts/_lib/runner.py`)
 
-Three functions: `cache_set(key, obj)`, `cache_get(key)`, `cache_release(key)`. Internally uses `pickle.dumps`/`loads` with `multiprocessing.shared_memory.SharedMemory`. Each function sends the corresponding gRPC message (CacheCreate/CacheLookup/CacheRelease) and manages local SharedMemory handles. See `scripts/_lib/runner.py` for the full typed implementation and `scripts/cache_produce/main.py` for a working example.
+Three functions: `cache_set(key, obj)`, `cache_get(key)`, `cache_release(key)`. Internally uses `pickle.dumps`/`loads` with `multiprocessing.shared_memory.SharedMemory`. `cache_set` sends a `CacheCreateRequest` and blocks on the `CacheCreateResponse` ack; a non-`CACHE_CREATE_OK` `error_code` (e.g. `CACHE_CREATE_DUPLICATE_KEY`) raises `RuntimeError`. `cache_get` sends a `CacheLookupRequest`. `cache_release` is fire-and-forget. See `scripts/_lib/runner.py` for the full typed implementation and `scripts/cache_produce/main.py` for a working example.
 
 ### Go Cache Manager (`internal/runner/cache.go`)
 

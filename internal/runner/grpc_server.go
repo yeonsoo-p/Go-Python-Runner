@@ -424,7 +424,7 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 	return nil
 }
 
-func (s *GRPCServer) handleCacheCreate(runID string, ch *RunChannel, req *pb.CacheCreate) error {
+func (s *GRPCServer) handleCacheCreate(runID string, ch *RunChannel, req *pb.CacheCreateRequest) error {
 	if s.cache.Register(req.Key, req.ShmName, req.Size, runID) {
 		s.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityInfo,
@@ -434,12 +434,10 @@ func (s *GRPCServer) handleCacheCreate(runID string, ch *RunChannel, req *pb.Cac
 			RunID:       runID,
 		})
 		return ch.streamSend(&pb.ServerMessage{
-			Msg: &pb.ServerMessage_CacheInfo{
-				CacheInfo: &pb.CacheInfo{
-					Key:     req.Key,
-					ShmName: req.ShmName,
-					Size:    req.Size,
-					Found:   true,
+			Msg: &pb.ServerMessage_CacheCreateResponse{
+				CacheCreateResponse: &pb.CacheCreateResponse{
+					Key:       req.Key,
+					ErrorCode: pb.CacheCreateError_CACHE_CREATE_OK,
 				},
 			},
 		})
@@ -456,25 +454,25 @@ func (s *GRPCServer) handleCacheCreate(runID string, ch *RunChannel, req *pb.Cac
 		RunID:       runID,
 	})
 	return ch.streamSend(&pb.ServerMessage{
-		Msg: &pb.ServerMessage_CacheInfo{
-			CacheInfo: &pb.CacheInfo{
-				Key:   req.Key,
-				Found: true,
-				Error: rejection,
+		Msg: &pb.ServerMessage_CacheCreateResponse{
+			CacheCreateResponse: &pb.CacheCreateResponse{
+				Key:          req.Key,
+				ErrorCode:    pb.CacheCreateError_CACHE_CREATE_DUPLICATE_KEY,
+				ErrorMessage: rejection,
 			},
 		},
 	})
 }
 
-func (s *GRPCServer) handleCacheLookup(runID string, ch *RunChannel, req *pb.CacheLookup) error {
+func (s *GRPCServer) handleCacheLookup(runID string, ch *RunChannel, req *pb.CacheLookupRequest) error {
 	shmName, size, found := s.cache.LookupAndRef(req.Key, runID)
 	return ch.streamSend(&pb.ServerMessage{
-		Msg: &pb.ServerMessage_CacheInfo{
-			CacheInfo: &pb.CacheInfo{
+		Msg: &pb.ServerMessage_CacheLookupResponse{
+			CacheLookupResponse: &pb.CacheLookupResponse{
 				Key:     req.Key,
+				Found:   found,
 				ShmName: shmName,
 				Size:    size,
-				Found:   found,
 			},
 		},
 	})
@@ -508,7 +506,7 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 	if d == nil {
 		return ch.streamSend(&pb.ServerMessage{
 			Msg: &pb.ServerMessage_FileDialogResponse{
-				FileDialogResponse: &pb.FileDialogResponse{Cancelled: true},
+				FileDialogResponse: cancelledDialog(),
 			},
 		})
 	}
@@ -520,10 +518,12 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 
 	var path string
 	var err error
-	switch req.Type {
-	case "save":
+	switch req.Kind {
+	case pb.DialogKind_DIALOG_KIND_SAVE:
 		path, err = d.SaveFile(req.Title, req.Directory, req.Filename, filters)
 	default:
+		// Treat UNSPECIFIED as Open — older clients that didn't set the field
+		// land here, and Open is the safer default (read-only).
 		path, err = d.OpenFile(req.Title, req.Directory, filters)
 	}
 
@@ -531,7 +531,7 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 	switch {
 	case errors.Is(err, ErrDialogCancelled):
 		// User-driven non-completion is silent — not a failure.
-		resp.Cancelled = true
+		resp.Outcome = &pb.FileDialogResponse_Cancelled{Cancelled: true}
 	case err != nil:
 		s.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityError,
@@ -542,12 +542,13 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 			RunID:       runID,
 			Err:         err,
 		})
-		resp.Cancelled = true
-		resp.Error = err.Error()
+		resp.Outcome = &pb.FileDialogResponse_Error{Error: err.Error()}
 	case path == "":
-		resp.Cancelled = true
+		resp.Outcome = &pb.FileDialogResponse_Cancelled{Cancelled: true}
 	default:
-		resp.Paths = []string{path}
+		resp.Outcome = &pb.FileDialogResponse_Selected{
+			Selected: &pb.SelectedPaths{Paths: []string{path}},
+		}
 	}
 
 	return ch.streamSend(&pb.ServerMessage{
@@ -557,8 +558,14 @@ func (s *GRPCServer) handleFileDialog(runID string, ch *RunChannel, req *pb.File
 	})
 }
 
-func (s *GRPCServer) handleDbExecute(runID string, ch *RunChannel, req *pb.DbExecute) error {
-	resp := &pb.DbResult{}
+func cancelledDialog() *pb.FileDialogResponse {
+	return &pb.FileDialogResponse{
+		Outcome: &pb.FileDialogResponse_Cancelled{Cancelled: true},
+	}
+}
+
+func (s *GRPCServer) handleDbExecute(runID string, ch *RunChannel, req *pb.DbExecuteRequest) error {
+	resp := &pb.DbExecuteResponse{}
 
 	args := make([]any, len(req.Params))
 	for i, p := range req.Params {
@@ -590,12 +597,12 @@ func (s *GRPCServer) handleDbExecute(runID string, ch *RunChannel, req *pb.DbExe
 	}
 
 	return ch.streamSend(&pb.ServerMessage{
-		Msg: &pb.ServerMessage_DbResult{DbResult: resp},
+		Msg: &pb.ServerMessage_DbExecuteResponse{DbExecuteResponse: resp},
 	})
 }
 
-func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQuery) error {
-	resp := &pb.DbQueryResult{}
+func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQueryRequest) error {
+	resp := &pb.DbQueryResponse{}
 
 	args := make([]any, len(req.Params))
 	for i, p := range req.Params {
@@ -658,7 +665,7 @@ func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQuery
 	}
 
 	return ch.streamSend(&pb.ServerMessage{
-		Msg: &pb.ServerMessage_DbQueryResult{DbQueryResult: resp},
+		Msg: &pb.ServerMessage_DbQueryResponse{DbQueryResponse: resp},
 	})
 }
 

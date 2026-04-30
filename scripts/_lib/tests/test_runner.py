@@ -33,19 +33,22 @@ def setup_function() -> None:
     runner._response_queue = runner.queue.Queue()
 
 
-def _prime_cache_create_response(*, error: str = "") -> None:
-    """Set up runner module so cache_set's _recv_response returns a CacheInfo.
+def _prime_cache_create_response(*, error_code: int = 0, error_message: str = "") -> None:
+    """Set up runner module so cache_set's _recv_response returns a CacheCreateResponse.
 
     Tests don't have a real gRPC stream, so we mark _stream as truthy and
     stub _start_reader_thread by flipping _reader_started to True. The fake
     response is preloaded onto _response_queue.
+
+    error_code defaults to CACHE_CREATE_OK; pass CACHE_CREATE_DUPLICATE_KEY to
+    simulate Go rejecting a duplicate registration.
     """
     from gen import runner_pb2 as pb
 
     runner._stream = object()  # truthy; _recv_response only checks for None
     runner._reader_started = True  # short-circuit _start_reader_thread
-    info = pb.CacheInfo(found=True, error=error)
-    runner._response_queue.put(pb.ServerMessage(cache_info=info))
+    ack = pb.CacheCreateResponse(error_code=error_code, error_message=error_message)
+    runner._response_queue.put(pb.ServerMessage(cache_create_response=ack))
 
 
 def _drain_messages(msg_iter: runner._MessageIterator, count: int) -> list[Any]:
@@ -141,7 +144,12 @@ def test_cache_set_raises_on_rejection() -> None:
     """When Go rejects a duplicate key, cache_set must release its just-created
     shm and raise — the script can't be allowed to keep working with the
     assumption that its data was shared."""
-    _prime_cache_create_response(error='cache key "dup" already registered')
+    from gen import runner_pb2 as pb
+
+    _prime_cache_create_response(
+        error_code=pb.CACHE_CREATE_DUPLICATE_KEY,
+        error_message='cache key "dup" already registered',
+    )
     with pytest.raises(RuntimeError, match="cache_set rejected"):
         runner.cache_set("dup", {"payload": 1})
     # Ref must NOT be stored — registration failed.
