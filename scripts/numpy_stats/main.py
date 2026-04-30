@@ -37,10 +37,7 @@ def main(params: dict[str, str]) -> None:
         output(f"{name}: {value:.4f}")
 
     result = {name: value for name, value in stats}
-    output(f"Result: {json.dumps(result)}")
-
-    # Send raw array bytes via data_result
-    data_result("array", arr.tobytes())
+    data_result("stats", json.dumps(result).encode())
 
     complete()
 

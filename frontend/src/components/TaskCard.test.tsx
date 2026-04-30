@@ -2,6 +2,11 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { describe, it, expect, vi } from 'vitest'
 import TaskCard from './TaskCard'
 import type { Script, RunState, RunGroupState } from '../hooks/useScripts'
+import { NotificationsProvider } from '../hooks/useNotifications'
+
+function renderWithNotifications(ui: React.ReactElement) {
+  return render(<NotificationsProvider>{ui}</NotificationsProvider>)
+}
 
 const mockScript: Script = {
   id: 'hello_world',
@@ -42,7 +47,7 @@ function makeRun(runID: string, scriptID: string, status: RunState['status'] = '
 
 describe('TaskCard', () => {
   it('renders script name and description', () => {
-    render(
+    renderWithNotifications(
       <TaskCard script={mockScript} runs={[]} onStartRun={vi.fn()} onCancelRun={vi.fn()} />
     )
     expect(screen.getByText('Hello World')).toBeInTheDocument()
@@ -50,14 +55,14 @@ describe('TaskCard', () => {
   })
 
   it('shows plugin badge for plugin scripts', () => {
-    render(
+    renderWithNotifications(
       <TaskCard script={pluginScript} runs={[]} onStartRun={vi.fn()} onCancelRun={vi.fn()} />
     )
     expect(screen.getByText('plugin')).toBeInTheDocument()
   })
 
   it('does not show plugin badge for builtin scripts', () => {
-    render(
+    renderWithNotifications(
       <TaskCard script={mockScript} runs={[]} onStartRun={vi.fn()} onCancelRun={vi.fn()} />
     )
     expect(screen.queryByText('plugin')).not.toBeInTheDocument()
@@ -72,7 +77,7 @@ describe('TaskCard', () => {
     }
     const runs = ['r1', 'r2', 'r3'].map((id) => makeRun(id, 'parallel_worker'))
 
-    render(
+    renderWithNotifications(
       <TaskCard
         script={parallelScript}
         runs={runs}

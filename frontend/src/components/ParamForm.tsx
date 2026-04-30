@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { Param } from '../hooks/useScripts'
+import { useNotifications } from '../hooks/useNotifications'
 
 interface ParallelConfig {
   default_workers: number
@@ -14,6 +15,7 @@ interface ParamFormProps {
 }
 
 function ParamForm({ params, parallel, onSubmit, disabled }: ParamFormProps) {
+  const { addNotification } = useNotifications()
   const [values, setValues] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {}
     for (const p of params) {
@@ -23,8 +25,21 @@ function ParamForm({ params, parallel, onSubmit, disabled }: ParamFormProps) {
   })
   const [workerCount, setWorkerCount] = useState(parallel?.default_workers ?? 1)
 
+  // Don't use HTML5 `required` — WebKitGTK / WebView2 source the validation
+  // popover string from the OS locale catalog, which can render empty under
+  // some locales. Validate explicitly and surface via the app's notifications.
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    const missing = params.filter(p => p.required && !values[p.name].trim()).map(p => p.name)
+    if (missing.length > 0) {
+      addNotification({
+        severity: 'error',
+        persistence: 'one-shot',
+        source: 'frontend',
+        message: `Required field${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}`,
+      })
+      return
+    }
     if (parallel) {
       onSubmit(values, workerCount)
     } else {
@@ -75,7 +90,6 @@ function ParamForm({ params, parallel, onSubmit, disabled }: ParamFormProps) {
               setValues((prev) => ({ ...prev, [param.name]: e.target.value }))
             }
             placeholder={param.description}
-            required={param.required}
             disabled={disabled}
             className="w-full px-3 py-2 rounded bg-slate-700 border border-slate-600 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 disabled:opacity-50"
           />

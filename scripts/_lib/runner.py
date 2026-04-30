@@ -336,9 +336,17 @@ def is_cancelled() -> bool:
 
 
 def cache_set(key: str, obj: object) -> None:
-    """Pickle any Python object into a shared memory block and register with Go."""
+    """Pickle any Python object into a shared memory block and register with Go.
+
+    ``track=False`` opts out of ``multiprocessing.resource_tracker``. Go's
+    ``CacheManager.CleanupRun`` is the canonical lifecycle authority (see
+    `_cleanup_cache`); leaving the tracker on causes any process that *opens*
+    this block to unlink it from ``/dev/shm`` on exit, killing the segment
+    while the producer is still alive. ``_cleanup_cache`` and Go provide the
+    backstop unlink for owned keys.
+    """
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    shm = shared_memory.SharedMemory(create=True, size=len(data))
+    shm = shared_memory.SharedMemory(create=True, size=len(data), track=False)
     try:
         if shm.buf is None:
             raise RuntimeError("SharedMemory buffer is None")
@@ -386,7 +394,7 @@ def cache_get(key: str) -> object:
             raise KeyError(f"Cache key not found: {key}")
 
     try:
-        shm = shared_memory.SharedMemory(name=info.shm_name)
+        shm = shared_memory.SharedMemory(name=info.shm_name, track=False)
     except FileNotFoundError:
         raise KeyError(
             f"Cache key '{key}' found in registry but shared memory '{info.shm_name}' "

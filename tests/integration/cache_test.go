@@ -70,6 +70,63 @@ func TestCacheShareObject(t *testing.T) {
 	_ = collectMessages(prodCh, 15*time.Second)
 }
 
+// TestCacheConsumerExitDoesNotUnlinkBlock is a regression for a Python
+// resource_tracker bug: by default `multiprocessing.shared_memory.SharedMemory`
+// registers every opened block (creator AND opener) with a per-process tracker
+// that calls shm_unlink on process exit. When a consumer exited it would
+// silently kill the producer's still-held segment, and any *subsequent*
+// cache_get would fail with "shared memory ... is no longer available
+// (reclaimed by OS after owning process exited)" even though the producer was
+// alive. The fix is `track=False` in cache_set/cache_get — Go owns lifecycle.
+//
+// This test runs two consumers sequentially against one long-holding producer.
+// Without the fix the second consumer fails because consumer #1's exit
+// unlinked /dev/shm/psm_<...>.
+func TestCacheConsumerExitDoesNotUnlinkBlock(t *testing.T) {
+	mgr, _, cleanup := testSetup(t)
+	defer cleanup()
+
+	_, prodCh, err := mgr.StartRun("cache_producer", map[string]string{"hold_seconds": "20"}, testdataDir(t, "cache_producer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitForOutput(prodCh, "cached:shared_data", 15*time.Second, t) {
+		t.Fatal("producer did not signal cache_set within timeout")
+	}
+
+	for i := 1; i <= 2; i++ {
+		_, consCh, err := mgr.StartRun("cache_consumer", map[string]string{}, testdataDir(t, "cache_consumer"))
+		if err != nil {
+			t.Fatalf("consumer %d StartRun: %v", i, err)
+		}
+		var retrieved string
+		var completed bool
+		for msg := range readWithTimeout(consCh, 15*time.Second) {
+			switch m := msg.(type) {
+			case runner.OutputMsg:
+				if strings.HasPrefix(m.Text, "retrieved:") {
+					retrieved = strings.TrimPrefix(m.Text, "retrieved:")
+				}
+			case runner.StatusMsg:
+				if m.State == runner.StatusCompleted {
+					completed = true
+				}
+			case runner.ErrorMsg:
+				t.Errorf("consumer %d error: %s\n%s", i, m.Message, m.Traceback)
+			}
+		}
+		if !completed {
+			t.Fatalf("consumer %d did not complete", i)
+		}
+		const want = `{"key": "value", "nested": {"a": true}, "numbers": [1, 2, 3]}`
+		if retrieved != want {
+			t.Errorf("consumer %d retrieved unexpected payload:\n  got:  %s\n  want: %s", i, retrieved, want)
+		}
+	}
+
+	_ = collectMessages(prodCh, 25*time.Second)
+}
+
 // TestCacheCleanupOnCrash verifies that after an owning script crashes, a
 // follow-up consumer cannot access the block — the registry must be cleaned
 // (no stale "found" entry pointing at reclaimed shm).
