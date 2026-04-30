@@ -8,7 +8,7 @@ service PythonRunner {
 
 // Naming convention:
 //   - Events (fire-and-forget, no reply expected): bare nouns
-//     (Output, Progress, Status, Error, DataResult, CacheRelease).
+//     (Output, Progress, Status, Error, CacheRelease).
 //   - Synchronous request/response pairs: `*Request` and `*Response` types.
 //     The Python helper holds `_request_lock` across send+recv so responses
 //     are delivered to the issuing thread in stream order.
@@ -21,15 +21,14 @@ message ClientMessage {
     Progress progress = 2;
     Status status = 3;
     Error error = 4;
-    DataResult data = 5;
-    CacheRelease cache_release = 8;
+    CacheRelease cache_release = 5;
 
     // Synchronous requests — Go replies via ServerMessage.
     CacheCreateRequest cache_create = 6;
     CacheLookupRequest cache_lookup = 7;
-    FileDialogRequest file_dialog = 9;
-    DbExecuteRequest db_execute = 10;
-    DbQueryRequest db_query = 11;
+    FileDialogRequest file_dialog = 8;
+    DbExecuteRequest db_execute = 9;
+    DbQueryRequest db_query = 10;
   }
 }
 
@@ -93,11 +92,6 @@ message Error {
   string message = 1;
   string traceback = 2;
   Severity severity = 3;
-}
-
-message DataResult {
-  string key = 1;
-  bytes value = 2;
 }
 
 // --- Cache messages ---

@@ -62,21 +62,6 @@ function RunOutput({ run }: RunOutputProps) {
         </pre>
       )}
 
-      {/* Data results */}
-      {run.data && Object.keys(run.data).length > 0 && (
-        <div className="bg-slate-800 border border-slate-600 rounded p-3">
-          <p className="text-xs text-slate-400 font-medium mb-2">Data Results</p>
-          {Object.entries(run.data).map(([key, value]) => (
-            <div key={key} className="flex gap-2 text-sm">
-              <span className="text-slate-400">{key}:</span>
-              <span className="text-slate-300 font-mono truncate" title={value}>
-                {value.length > 64 ? `${value.slice(0, 64)}...` : value}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-
       {/* Error display */}
       {run.error && (
         <div className="bg-red-900/30 border border-red-800 rounded p-3">

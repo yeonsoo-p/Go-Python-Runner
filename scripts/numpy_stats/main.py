@@ -1,14 +1,12 @@
 """Numpy Statistics — computes stats on numeric data using a pre-installed package.
 
-Exercises: numpy (pre-installed), output, progress, complete, data_result.
+Exercises: numpy (pre-installed), output, progress, complete.
 """
 
 from __future__ import annotations
 
-import json
-
 import numpy as np
-from runner import complete, data_result, fail, output, progress, run
+from runner import complete, fail, output, progress, run
 
 
 def main(params: dict[str, str]) -> None:
@@ -35,9 +33,6 @@ def main(params: dict[str, str]) -> None:
     for i, (name, value) in enumerate(stats):
         progress(i + 1, len(stats), f"Computing {name}")
         output(f"{name}: {value:.4f}")
-
-    result = {name: value for name, value in stats}
-    data_result("stats", json.dumps(result).encode())
 
     complete()
 

@@ -42,19 +42,17 @@ func FuzzClientMessageHandler(f *testing.F) {
 	//          one extra value leaves the oneof unset, also wire-realistic).
 	// s1, s2: arbitrary string fields.
 	// i1, i2: arbitrary int32 fields.
-	// b: arbitrary bytes (used for DataMsg.Value).
-	f.Add(uint8(0), "hello", "world", int32(0), int32(0), []byte("d"))
-	f.Add(uint8(1), "", "label", int32(1), int32(10), []byte{})
-	f.Add(uint8(2), "completed", "", int32(0), int32(0), []byte{})
-	f.Add(uint8(2), "failed", "", int32(0), int32(0), []byte{})
-	f.Add(uint8(2), "running", "", int32(0), int32(0), []byte{}) // not a terminal state
-	f.Add(uint8(2), "", "", int32(0), int32(0), []byte{})        // empty state string
-	f.Add(uint8(3), "err msg", "tb", int32(0), int32(0), []byte{})
-	f.Add(uint8(4), "key", "", int32(0), int32(0), []byte("payload"))
-	f.Add(uint8(5), "key", "shm", int32(1024), int32(0), []byte{}) // CacheCreate
-	f.Add(uint8(6), "key", "", int32(0), int32(0), []byte{})       // CacheLookup
-	f.Add(uint8(7), "key", "", int32(0), int32(0), []byte{})       // CacheRelease
-	f.Add(uint8(99), "", "", int32(0), int32(0), []byte{})         // unset oneof
+	f.Add(uint8(0), "hello", "world", int32(0), int32(0))
+	f.Add(uint8(1), "", "label", int32(1), int32(10))
+	f.Add(uint8(2), "completed", "", int32(0), int32(0))
+	f.Add(uint8(2), "failed", "", int32(0), int32(0))
+	f.Add(uint8(2), "running", "", int32(0), int32(0)) // not a terminal state
+	f.Add(uint8(2), "", "", int32(0), int32(0))        // empty state string
+	f.Add(uint8(3), "err msg", "tb", int32(0), int32(0))
+	f.Add(uint8(4), "key", "shm", int32(1024), int32(0)) // CacheCreate
+	f.Add(uint8(5), "key", "", int32(0), int32(0))       // CacheLookup
+	f.Add(uint8(6), "key", "", int32(0), int32(0))       // CacheRelease
+	f.Add(uint8(7), "", "", int32(0), int32(0))          // unset oneof (7 % 8 == 7)
 
 	cache := NewCacheManager()
 	store, err := db.Open(":memory:")
@@ -71,16 +69,13 @@ func FuzzClientMessageHandler(f *testing.F) {
 		reservoir: &notify.RecordingReservoir{},
 	}
 
-	f.Fuzz(func(t *testing.T, variant uint8, s1, s2 string, i1, i2 int32, b []byte) {
+	f.Fuzz(func(t *testing.T, variant uint8, s1, s2 string, i1, i2 int32) {
 		// Cap fuzz-supplied lengths to keep a single iteration fast.
 		if len(s1) > 4096 {
 			s1 = s1[:4096]
 		}
 		if len(s2) > 4096 {
 			s2 = s2[:4096]
-		}
-		if len(b) > 4096 {
-			b = b[:4096]
 		}
 
 		runID := "fuzz-run"
@@ -107,7 +102,7 @@ func FuzzClientMessageHandler(f *testing.F) {
 			}
 		})
 
-		msg := buildClientMessage(variant, s1, s2, i1, i2, b)
+		msg := buildClientMessage(variant, s1, s2, i1, i2)
 
 		// Must not panic regardless of input.
 		_ = srv.handleClientMessage(runID, ch, msg, noopExecuteServer{})
@@ -121,10 +116,10 @@ func FuzzClientMessageHandler(f *testing.F) {
 
 // buildClientMessage constructs a wire-realistic ClientMessage: every set
 // oneof variant has a non-nil sub-message, mirroring protobuf unmarshaler
-// behavior. Variant N >= 9 leaves the oneof unset (also wire-valid).
-func buildClientMessage(variant uint8, s1, s2 string, i1, i2 int32, b []byte) *pb.ClientMessage {
+// behavior. Variant N where N % 8 == 7 leaves the oneof unset (also wire-valid).
+func buildClientMessage(variant uint8, s1, s2 string, i1, i2 int32) *pb.ClientMessage {
 	msg := &pb.ClientMessage{}
-	switch variant % 9 {
+	switch variant % 8 {
 	case 0:
 		msg.Msg = &pb.ClientMessage_Output{Output: &pb.Output{Text: s1}}
 	case 1:
@@ -134,14 +129,12 @@ func buildClientMessage(variant uint8, s1, s2 string, i1, i2 int32, b []byte) *p
 	case 3:
 		msg.Msg = &pb.ClientMessage_Error{Error: &pb.Error{Message: s1, Traceback: s2}}
 	case 4:
-		msg.Msg = &pb.ClientMessage_Data{Data: &pb.DataResult{Key: s1, Value: b}}
-	case 5:
 		msg.Msg = &pb.ClientMessage_CacheCreate{CacheCreate: &pb.CacheCreateRequest{Key: s1, ShmName: s2, Size: int64(i1)}}
-	case 6:
+	case 5:
 		msg.Msg = &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookupRequest{Key: s1}}
-	case 7:
+	case 6:
 		msg.Msg = &pb.ClientMessage_CacheRelease{CacheRelease: &pb.CacheRelease{Key: s1}}
-	case 8:
+	case 7:
 		// Unset oneof — msg.Msg stays nil. Dispatcher's type switch falls through.
 	}
 	return msg

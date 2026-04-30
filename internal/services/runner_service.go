@@ -365,22 +365,6 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 			})
 			lastErrMessage = m.Message
 			lastErrTraceback = m.Traceback
-		case runner.DataMsg:
-			s.emit("run:data", map[string]any{
-				"runID":    runID,
-				"scriptID": scriptID,
-				"groupID":  groupID,
-				"key":      m.Key,
-				"value":    m.Value,
-			})
-			s.reservoir.Report(notify.Event{
-				Severity:    notify.SeverityInfo,
-				Persistence: notify.PersistenceOneShot,
-				Source:      notify.SourcePython,
-				Message:     fmt.Sprintf("data result: key=%s", m.Key),
-				RunID:       runID,
-				ScriptID:    scriptID,
-			})
 		}
 	}
 }

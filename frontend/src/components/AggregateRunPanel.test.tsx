@@ -11,7 +11,6 @@ function makeRun(overrides: Partial<RunState>): RunState {
     output: [],
     progress: null,
     error: null,
-    data: null,
     ...overrides,
   }
 }

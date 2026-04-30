@@ -42,7 +42,7 @@ const parallelScript: Script = {
 }
 
 function makeRun(runID: string, scriptID: string, status: RunState['status'] = 'running'): RunState {
-  return { runID, scriptID, status, output: [], progress: null, error: null, data: null }
+  return { runID, scriptID, status, output: [], progress: null, error: null }
 }
 
 describe('TaskCard', () => {

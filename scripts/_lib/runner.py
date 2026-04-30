@@ -318,11 +318,6 @@ def run(main_func: Callable[[dict[str, str]], None]) -> None:
         fail(str(e))
 
 
-def data_result(key: str, value: bytes) -> None:
-    """Send a data result (binary) to Go."""
-    _send(runner_pb2.ClientMessage(data=runner_pb2.DataResult(key=str(key), value=bytes(value))))
-
-
 def is_cancelled() -> bool:
     """Check if the Go backend has requested cancellation.
 

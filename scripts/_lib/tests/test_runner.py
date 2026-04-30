@@ -99,15 +99,6 @@ def test_fail_sends_error_and_status() -> None:
     assert msgs[1].status.state == "failed"
 
 
-def test_data_result_sends_bytes() -> None:
-    runner.data_result("key1", b"\x00\x01\x02")
-    msgs = _drain_messages(runner._msg_iter, 1)
-    assert len(msgs) == 1
-    assert msgs[0].HasField("data")
-    assert msgs[0].data.key == "key1"
-    assert msgs[0].data.value == b"\x00\x01\x02"
-
-
 def test_output_converts_to_string() -> None:
     runner.output(42)
     msgs = _drain_messages(runner._msg_iter, 1)

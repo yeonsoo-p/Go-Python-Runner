@@ -33,13 +33,10 @@ type ErrorMsg struct {
 	// SEVERITY_UNSPECIFIED (0) is mapped to Error downstream.
 	Severity int32
 }
-type DataMsg struct{ Key string; Value []byte }
-
 func (OutputMsg) messageType()   {}
 func (ProgressMsg) messageType() {}
 func (StatusMsg) messageType()   {}
 func (ErrorMsg) messageType()    {}
-func (DataMsg) messageType()     {}
 
 // RunPhase is the lifecycle of a RunChannel. Three phases with callers:
 // Registered (constructed), Connected (Python's Execute arrived), Done
@@ -398,11 +395,6 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Message:   m.Error.Message,
 			Traceback: m.Error.Traceback,
 			Severity:  int32(m.Error.Severity),
-		})
-	case *pb.ClientMessage_Data:
-		ch.trySend(DataMsg{
-			Key:   m.Data.Key,
-			Value: m.Data.Value,
 		})
 	case *pb.ClientMessage_CacheCreate:
 		if err := s.handleCacheCreate(runID, ch, m.CacheCreate); err != nil {

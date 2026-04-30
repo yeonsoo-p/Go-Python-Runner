@@ -21,7 +21,6 @@ export interface RunState {
   output: string[]
   progress: { current: number; total: number; label: string } | null
   error: { message: string; traceback: string } | null
-  data: Record<string, string> | null
 }
 
 // RunGroupState describes a parallel-run batch returned by StartParallelRuns.
@@ -40,7 +39,6 @@ interface OutputEvent { runID: string; scriptID: string; groupID?: string; text:
 interface ProgressEvent { runID: string; scriptID: string; groupID?: string; current: number; total: number; label: string }
 interface StatusEvent { runID: string; scriptID: string; groupID?: string; state: RunStatus }
 interface ErrorEvent { runID: string; scriptID: string; groupID?: string; message: string; traceback: string }
-interface DataEvent { runID: string; scriptID: string; groupID?: string; key: string; value: string }
 
 export function useScripts() {
   const [scripts, setScripts] = useState<Script[]>([])
@@ -123,7 +121,7 @@ export function useScripts() {
               const next = new Map(prev)
               const run = next.get(data.runID) || {
                 runID: data.runID, scriptID: data.scriptID,
-                status: defaultStatus, output: [], progress: null, error: null, data: null,
+                status: defaultStatus, output: [], progress: null, error: null,
               }
               updater(run, data)
               next.set(data.runID, run)
@@ -149,12 +147,8 @@ export function useScripts() {
         const onError = onRunEvent<ErrorEvent>('run:error', 'running', (run, data) => {
           run.error = { message: data.message, traceback: data.traceback }
         })
-        const onData = onRunEvent<DataEvent>('run:data', 'running', (run, data) => {
-          // Go []byte is JSON-marshaled as a base64 string by Wails.
-          run.data = { ...(run.data || {}), [data.key]: data.value }
-        })
 
-        cleanup = [onOutput, onProgress, onStatus, onError, onData].map(unsub => () => unsub())
+        cleanup = [onOutput, onProgress, onStatus, onError].map(unsub => () => unsub())
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         // Persistent: live updates broken but the app can still launch scripts.
@@ -196,7 +190,7 @@ export function useScripts() {
           // (fast scripts can emit events before StartRun returns).
           if (!next.has(runID)) {
             next.set(runID, {
-              runID, scriptID, status: 'running', output: [], progress: null, error: null, data: null,
+              runID, scriptID, status: 'running', output: [], progress: null, error: null,
             })
           }
           return next
@@ -226,7 +220,7 @@ export function useScripts() {
           for (const runID of runIDs) {
             if (!next.has(runID)) {
               next.set(runID, {
-                runID, scriptID, status: 'running', output: [], progress: null, error: null, data: null,
+                runID, scriptID, status: 'running', output: [], progress: null, error: null,
               })
             }
           }
