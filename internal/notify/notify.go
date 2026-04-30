@@ -1,13 +1,7 @@
-// Package notify is the central error reservoir.
-//
-// Every error from any source — Python script failures, Go service errors,
-// frontend JS errors — flows through Reservoir.Report. The reservoir owns
-// the (Severity × Persistence) → UI surface routing and writes a structured
-// slog record for every event. Callers cannot pick "slog without surface"
-// or "surface without slog" by accident: a single Report call satisfies
-// both halves of the four-part error contract documented in CLAUDE.md.
-//
-// See CLAUDE.md § Error Handling for the full philosophy.
+// Package notify is the central error reservoir. Every event from every
+// source flows through Reservoir.Report, which owns the (Severity ×
+// Persistence) → UI surface routing and writes the structured slog record
+// in the same call.
 package notify
 
 import (

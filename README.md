@@ -4,7 +4,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 
 ## Architecture
 
-```
+```text
 ┌──────────────────────────────────┐
 │  React Frontend (Task Cards)     │  Wails v3 webview
 │  - Auto-generated TS bindings    │
@@ -40,7 +40,7 @@ A native desktop application that orchestrates bundled Python scripts through a 
 ## Tech Stack
 
 | Layer | Technology |
-|---|---|
+| --- | --- |
 | Desktop framework | [Wails v3](https://v3alpha.wails.io/) |
 | Backend | Go |
 | Frontend | React 19 + TypeScript + Vite + Tailwind |
@@ -130,7 +130,7 @@ make lint-frontend     # tsc --noEmit
 ## Sample Scripts
 
 | Script | What it demonstrates |
-|---|---|
+| --- | --- |
 | **Hello World** | Basic output and progress |
 | **Data Processor** | Iterative text analysis with configurable depth |
 | **Numpy Stats** | Pre-installed package usage + data results |

@@ -139,12 +139,9 @@ type ContractExpectation struct {
 	MessageContains string
 }
 
-// AssertContract verifies the four-part error contract on the most recent
-// matching event (matched by severity). Fails the test via t.Errorf for
-// each axis that disagrees. This is the helper Phase G describes:
-// service tests assert that an error path produced an Event with the
-// expected severity/persistence/source — Phase B already proves Report
-// always slog-writes, so callers don't need to re-prove that here.
+// AssertContract verifies that the most recent event matching want.Severity
+// was reported with the expected persistence/source/RunID/ScriptID and (if
+// set) MessageContains substring.
 //
 // Usage:
 //
@@ -156,7 +153,6 @@ type ContractExpectation struct {
 //	    Severity:    notify.SeverityError,
 //	    Persistence: notify.PersistenceOneShot,
 //	    Source:      notify.SourceBackend,
-//	    RunID:       "run-42",
 //	})
 func AssertContract(t TestingT, rec *RecordingReservoir, want ContractExpectation) {
 	t.Helper()

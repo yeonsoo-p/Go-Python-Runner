@@ -66,11 +66,9 @@ func main() {
 		Message:     "database initialized: " + dsn,
 	})
 
-	// Initialize script registry
 	reg := registry.New(reservoir)
 	scriptsDir := findScriptsDir()
 	pluginDir := registry.DefaultPluginDir()
-	// Best-effort: ensure the plugin dir exists so the watcher can attach.
 	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
 		reservoir.Report(notify.Event{
 			Severity:    notify.SeverityWarn,
@@ -109,10 +107,8 @@ func main() {
 			len(reg.List()), scriptsDir, reg.PluginDir(), len(reg.Issues())),
 	})
 
-	// Initialize cache manager
 	cache := runner.NewCacheManager()
 
-	// Initialize gRPC server
 	grpcServer, err := runner.NewGRPCServer(cache, store, reservoir)
 	if err != nil {
 		log.Fatalf("failed to start gRPC server: %v", err)
@@ -125,7 +121,6 @@ func main() {
 		Message:     "gRPC server started: addr=" + grpcServer.Addr(),
 	})
 
-	// Monitor gRPC server for runtime failures
 	go func() {
 		if err := <-grpcServer.ServeErr(); err != nil {
 			reservoir.Report(notify.Event{
@@ -140,11 +135,9 @@ func main() {
 		}
 	}()
 
-	// Initialize process manager
 	mgr := runner.NewManager(grpcServer, cache, store, reservoir)
 	mgr.LibDir = filepath.Join(scriptsDir, "_lib")
 
-	// Create Wails services
 	scriptSvc := services.NewScriptService(reg, reservoir, scriptsDir, pluginDir)
 	runnerSvc := services.NewRunnerService(mgr, reg, reservoir)
 	logSvc := services.NewLogService(ring, reservoir)
@@ -162,7 +155,6 @@ func main() {
 		})
 	}
 
-	// Create Wails application
 	wailsServices := []application.Service{
 		application.NewService(scriptSvc),
 		application.NewService(runnerSvc),
@@ -278,16 +270,12 @@ func main() {
 		URL:              "/",
 	})
 
-	// Run the application
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Window closed: cancel any still-running scripts so grpcServer.Stop's
-	// GracefulStop doesn't block waiting for long-lived bidi streams (e.g.
-	// cache_produce holding for 30s). Cancel fires async with a 3s grace
-	// window before kill, so worst-case shutdown lag drops from "as long as
-	// the slowest script" to ~3s.
+	// Cancel still-running scripts so grpcServer.Stop's GracefulStop doesn't
+	// block on long-lived bidi streams. Cancel is async with a 3s kill grace.
 	mgr.CancelAll()
 }
 
@@ -308,9 +296,9 @@ func (h *wailsDialogHandler) OpenFile(title, directory string, filters []runner.
 		d.AddFilter(f.DisplayName, f.Pattern)
 	}
 	path, err := d.PromptForSingleSelection()
+	// Empty path = user cancelled (some platforms return nil err, some return
+	// a specific err); normalize both to ErrDialogCancelled.
 	if path == "" {
-		// Empty path = user cancelled, regardless of err. Different platforms
-		// surface cancel as nil-err vs. a specific err; treat both as cancel.
 		return "", runner.ErrDialogCancelled
 	}
 	return path, err
@@ -337,16 +325,15 @@ func (h *wailsDialogHandler) SaveFile(title, directory, filename string, filters
 	return path, err
 }
 
-// findScriptsDir locates the scripts directory relative to the executable or CWD.
+// findScriptsDir locates the scripts directory: CWD/scripts (dev) then
+// <exe>/scripts (distribution).
 func findScriptsDir() string {
-	// Check relative to CWD first (dev mode)
 	if info, err := os.Stat("scripts"); err == nil && info.IsDir() {
 		if abs, err := filepath.Abs("scripts"); err == nil {
 			return abs
 		}
 	}
 
-	// Check relative to executable (distribution mode)
 	if execPath, err := os.Executable(); err == nil {
 		scriptsDir := filepath.Join(filepath.Dir(execPath), "scripts")
 		if info, err := os.Stat(scriptsDir); err == nil && info.IsDir() {

@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-// LogEntry represents a single structured log record.
 type LogEntry struct {
 	Timestamp time.Time
 	Level     string
@@ -16,19 +15,17 @@ type LogEntry struct {
 	Traceback string
 }
 
-// RingBuffer is a fixed-capacity circular buffer of LogEntry values.
-// It is safe for concurrent use.
+// RingBuffer is a thread-safe fixed-capacity circular buffer of LogEntry.
 type RingBuffer struct {
 	mu       sync.RWMutex
 	entries  []LogEntry
 	cap      int
-	head     int // next write position
+	head     int
 	count    int
 	onPushMu sync.RWMutex
-	onPush   func(LogEntry) // called after each push, outside the write lock
+	onPush   func(LogEntry)
 }
 
-// NewRingBuffer creates a ring buffer with the given capacity.
 func NewRingBuffer(capacity int) *RingBuffer {
 	return &RingBuffer{
 		entries: make([]LogEntry, capacity),
@@ -43,7 +40,7 @@ func (r *RingBuffer) SetOnPush(fn func(LogEntry)) {
 	r.onPush = fn
 }
 
-// Push adds an entry to the ring buffer, evicting the oldest if full.
+// Push appends an entry, evicting the oldest if full.
 func (r *RingBuffer) Push(entry LogEntry) {
 	r.mu.Lock()
 	r.entries[r.head] = entry
@@ -61,15 +58,14 @@ func (r *RingBuffer) Push(entry LogEntry) {
 	}
 }
 
-// Len returns the number of entries currently stored.
 func (r *RingBuffer) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.count
 }
 
-// Entries returns all stored entries in chronological order.
-// Filtering by source/level/runID is done client-side (LogViewer).
+// Entries returns stored entries in chronological order. The LogViewer
+// applies any source/level/runID filtering client-side.
 func (r *RingBuffer) Entries() []LogEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

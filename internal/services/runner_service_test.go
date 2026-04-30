@@ -138,10 +138,9 @@ func TestRunnerService_CancelGroup_NotFound(t *testing.T) {
 	})
 }
 
-// newTestRunnerService wires a RunnerService against a real Manager + GRPCServer
-// + in-memory DB. The Wails app is intentionally unset so emit() becomes a
-// no-op — forwardMessages still records reservoir events (the orthodoxy:
-// every event flows through one ingress regardless of UI state).
+// newTestRunnerService wires a RunnerService against a real Manager +
+// GRPCServer + in-memory DB. The Wails app is left unset so emit() is a
+// no-op; forwardMessages still records reservoir events.
 func newTestRunnerService(t *testing.T) (*RunnerService, *notify.RecordingReservoir, func()) {
 	t.Helper()
 	cache := runner.NewCacheManager()
@@ -160,11 +159,9 @@ func newTestRunnerService(t *testing.T) (*RunnerService, *notify.RecordingReserv
 	}
 }
 
-// TestForwardMessages_FailureToastUsesRealError covers Part D1: the
-// "Run failed" toast body should carry the real Python error text (and
-// traceback) captured from the immediately-preceding ErrorMsg, not the
-// useless "<scriptID> failed" placeholder. Sequence guarantee comes from
-// runner.fail(): ErrorMsg is sent before StatusMsg(failed).
+// The "Run failed" toast body should carry the real Python error text and
+// traceback from the preceding ErrorMsg, not "<scriptID> failed". Python's
+// runner.fail() guarantees ErrorMsg is sent before StatusMsg(failed).
 func TestForwardMessages_FailureToastUsesRealError(t *testing.T) {
 	svc, rec, cleanup := newTestRunnerService(t)
 	defer cleanup()
@@ -232,11 +229,9 @@ func TestForwardMessages_FailureToastFallback(t *testing.T) {
 	}
 }
 
-// TestForwardMessages_CancelledRunDemotesErrorMsg covers Part A4: when the
-// run was cancelled by the user, Python's cooperative-cancel fail("Cancelled
-// by user") arrives as an ErrorMsg. It must be demoted to Info+OneShot
-// (log-only per the routing matrix) instead of routing to the per-run pane
-// (PersistenceInFlight). The reservoir still records it — never dropped.
+// When the user cancels a run, Python's cooperative-cancel
+// fail("Cancelled by user") arrives as an ErrorMsg. It must be demoted to
+// Info+OneShot instead of routing to the per-run pane.
 func TestForwardMessages_CancelledRunDemotesErrorMsg(t *testing.T) {
 	svc, rec, cleanup := newTestRunnerService(t)
 	defer cleanup()

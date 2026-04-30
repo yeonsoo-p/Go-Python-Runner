@@ -2,20 +2,8 @@ import { useEffect } from 'react'
 import { useNotifications } from './useNotifications'
 import type { NotificationInput, NotificationSource, Severity } from './useNotifications'
 
-// useNotifyChannel is the only place in the frontend that subscribes to the
-// notify:* Wails events. Translates each Go reservoir emission into a call
-// on useNotifications. Mount this once near the root (App.tsx).
-//
-// Channel summary:
-//   notify:toast         → addNotification(persistence='one-shot')
-//   notify:banner        → addNotification(persistence='ongoing'); deduped by key
-//   notify:banner:dismiss → dismissByKey
-//   notify:critical      → addNotification(persistence='catastrophic')
-//   notify:banners:list  → replaceOngoingBanners (atomic snapshot from Go)
-//
-// run:error and log:entry are NOT consumed here — they pre-date the reservoir
-// and have their own consumers (RunOutput per-run pane and LogViewer
-// respectively).
+// Single subscription point for notify:* Wails events. Mount once near the
+// root (App.tsx). run:error and log:entry have their own consumers.
 
 interface ToastPayload {
   id?: string

@@ -23,6 +23,8 @@ import (
 // Asserts the RunChannel flag invariants hold under concurrent reads:
 //   - errorMessage non-nil iff gotError set
 //   - flag transitions are monotonic (set → set, never set → unset)
+//   - pythonStatus is first-write-wins: gotFailedStatus and gotCompletedStatus
+//     are mutually exclusive (Python is expected to send one terminal status)
 func TestRunChannelFlagConsistency(t *testing.T) {
 	cache := runner.NewCacheManager()
 	store, err := db.Open(":memory:")
@@ -118,11 +120,14 @@ func TestRunChannelFlagConsistency(t *testing.T) {
 	if !prevError {
 		t.Errorf("never observed gotError set")
 	}
+	// First-write-wins: exactly one of failed/completed must be set, not both.
+	// Order is deterministic (iter 2 sends failed before iter 3 sends completed),
+	// so gotFailedStatus must win.
 	if !prevFailed {
-		t.Errorf("never observed gotFailedStatus set")
+		t.Errorf("never observed gotFailedStatus set (expected: failed wins first-write CAS)")
 	}
-	if !prevCompleted {
-		t.Errorf("never observed gotCompletedStatus set")
+	if prevCompleted {
+		t.Errorf("gotCompletedStatus set despite failed arriving first; first-write-wins violated")
 	}
 
 	stream.CloseSend()

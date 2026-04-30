@@ -17,10 +17,9 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-// messageBufferSize is the capacity of the per-run message channel.
 const messageBufferSize = 100
 
-// Message is the interface for typed messages received from Python scripts.
+// Message is the interface for typed messages received from Python.
 type Message interface {
 	messageType()
 }
@@ -30,10 +29,8 @@ type ProgressMsg struct{ Current, Total int32; Label string }
 type StatusMsg struct{ State RunStatus }
 type ErrorMsg struct {
 	Message, Traceback string
-	// Severity carries the proto runner.Severity enum value verbatim so
-	// downstream layers (RunnerService.forwardMessages) can map it to the
-	// appropriate notify.Severity. Zero (SEVERITY_UNSPECIFIED) means the
-	// caller didn't set one — treat as ERROR for back-compat.
+	// Severity carries the proto runner.Severity enum value verbatim;
+	// SEVERITY_UNSPECIFIED (0) is mapped to Error downstream.
 	Severity int32
 }
 type DataMsg struct{ Key string; Value []byte }
@@ -44,45 +41,108 @@ func (StatusMsg) messageType()   {}
 func (ErrorMsg) messageType()    {}
 func (DataMsg) messageType()     {}
 
-// RunChannel holds the message channel and server-to-client stream for a run.
-type RunChannel struct {
-	Messages      chan Message
-	stream        pb.PythonRunner_ExecuteServer
-	streamMu      sync.Mutex   // protects stream.Send() — gRPC streams are not safe for concurrent sends
-	cancel        chan struct{}
-	connected     chan struct{} // closed when Python connects
-	connectOnce   sync.Once    // prevents double-close on connected
-	streamDone    chan struct{} // closed when Execute() returns (all messages forwarded)
-	closed        bool         // true after UnregisterRun closes Messages
-	closedMu      sync.Mutex   // protects closed flag and channel sends
-	// Manager-internal flags. Set by gRPC handlers from incoming Python messages,
-	// read by Manager.waitForExit when deriving finalStatus. Manager is the sole
-	// authority on the user-visible run status; these flags never reach the
-	// frontend on their own.
-	gotError           atomic.Bool            // true if an ErrorMsg was received via gRPC
-	gotCompletedStatus atomic.Bool            // true if a StatusMsg with state "completed" was received
-	gotFailedStatus    atomic.Bool            // true if a StatusMsg with state "failed" was received
-	errorMessage       atomic.Pointer[string] // last ErrorMsg text, nil if none
+// RunPhase is the lifecycle of a RunChannel. Three phases with callers:
+// Registered (constructed), Connected (Python's Execute arrived), Done
+// (Messages chan closed). transitionTo enforces monotonic progression.
+type RunPhase int32
+
+const (
+	PhaseRegistered RunPhase = iota
+	PhaseConnected
+	PhaseDone
+)
+
+func (p RunPhase) String() string {
+	switch p {
+	case PhaseRegistered:
+		return "registered"
+	case PhaseConnected:
+		return "connected"
+	case PhaseDone:
+		return "done"
+	}
+	return "unknown"
 }
 
-// GRPCServer implements the PythonRunner gRPC service.
+type RunChannel struct {
+	Messages   chan Message
+	stream     pb.PythonRunner_ExecuteServer
+	streamMu   sync.Mutex // gRPC stream Send() is not safe for concurrent use
+	cancel     chan struct{}
+	connected  chan struct{} // closed on transition to PhaseConnected
+	streamDone chan struct{} // closed when Execute() returns
+
+	phase   atomic.Int32 // RunPhase
+	phaseMu sync.Mutex   // serializes Messages-chan close vs concurrent trySend
+
+	// Payloads from Python; orthogonal to phase. pythonStatus carries the
+	// terminal status Python reported (Completed | Failed); first-write-wins.
+	pythonStatus atomic.Pointer[RunStatus]
+	gotError     atomic.Bool
+	errorMessage atomic.Pointer[string]
+}
+
+func newRunChannel() *RunChannel {
+	return &RunChannel{
+		Messages:   make(chan Message, messageBufferSize),
+		cancel:     make(chan struct{}),
+		connected:  make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+}
+
+// transitionTo atomically advances phase. Returns true if the transition was
+// applied. Invalid transitions (backward, skip-forward to non-Done) return
+// false and leave the phase unchanged. Side effects (closing channels) fire
+// only on the winning CAS.
+func (ch *RunChannel) transitionTo(target RunPhase) bool {
+	if target == PhaseDone {
+		ch.phaseMu.Lock()
+		defer ch.phaseMu.Unlock()
+	}
+	for {
+		cur := RunPhase(ch.phase.Load())
+		if !legalPhaseTransition(cur, target) {
+			return false
+		}
+		if ch.phase.CompareAndSwap(int32(cur), int32(target)) {
+			switch target {
+			case PhaseConnected:
+				close(ch.connected)
+			case PhaseDone:
+				close(ch.Messages)
+			}
+			return true
+		}
+	}
+}
+
+func legalPhaseTransition(from, to RunPhase) bool {
+	if to == PhaseDone {
+		return from != PhaseDone
+	}
+	return from == PhaseRegistered && to == PhaseConnected
+}
+
+func (ch *RunChannel) Phase() RunPhase {
+	return RunPhase(ch.phase.Load())
+}
+
 type GRPCServer struct {
 	pb.UnimplementedPythonRunnerServer
 
 	mu        sync.RWMutex
-	runs      map[string]*RunChannel // runID -> channel
+	runs      map[string]*RunChannel
 	cache     *CacheManager
 	db        *db.DB
 	reservoir notify.Reservoir
 	server    *grpc.Server
 	listener  net.Listener
-	dialog    atomic.Value // stores DialogHandler; set after Wails init, read from goroutines
-	serveErr  chan error   // buffered(1), receives Serve() error if it fails
+	dialog    atomic.Value // DialogHandler, set after Wails init
+	serveErr  chan error
 }
 
-// NewGRPCServer creates and starts a gRPC server on a random port. The
-// reservoir is the sole observability dependency — DB errors, file dialog
-// failures, and serve-time crashes all flow through reservoir.Report.
+// NewGRPCServer starts a gRPC server on a random localhost port.
 func NewGRPCServer(cache *CacheManager, store *db.DB, reservoir notify.Reservoir) (*GRPCServer, error) {
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -118,68 +178,55 @@ func NewGRPCServer(cache *CacheManager, store *db.DB, reservoir notify.Reservoir
 	return s, nil
 }
 
-// ServeErr returns a channel that receives an error if the gRPC server fails at runtime.
 func (s *GRPCServer) ServeErr() <-chan error {
 	return s.serveErr
 }
 
-// SetDialogHandler sets the native file dialog handler (called after Wails app init).
 func (s *GRPCServer) SetDialogHandler(d DialogHandler) {
 	s.dialog.Store(d)
 }
 
-// Addr returns the address the gRPC server is listening on.
 func (s *GRPCServer) Addr() string {
 	return s.listener.Addr().String()
 }
 
-// RegisterRun creates a message channel for a run. Must be called before
+// RegisterRun creates the message channel for runID. Must be called before
 // the Python script connects.
 func (s *GRPCServer) RegisterRun(runID string) <-chan Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := &RunChannel{
-		Messages:   make(chan Message, messageBufferSize),
-		cancel:     make(chan struct{}),
-		connected:  make(chan struct{}),
-		streamDone: make(chan struct{}),
-	}
+	ch := newRunChannel()
 	s.runs[runID] = ch
 	return ch.Messages
 }
 
-// UnregisterRun removes a run's channel.
 func (s *GRPCServer) UnregisterRun(runID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ch, ok := s.runs[runID]; ok {
-		ch.closedMu.Lock()
-		ch.closed = true
-		close(ch.Messages)
-		ch.closedMu.Unlock()
+		ch.transitionTo(PhaseDone)
 		delete(s.runs, runID)
 	}
 }
 
-// trySend safely sends a message to the run channel, returning false if closed.
 func (ch *RunChannel) trySend(msg Message) bool {
-	ch.closedMu.Lock()
-	defer ch.closedMu.Unlock()
-	if ch.closed {
+	ch.phaseMu.Lock()
+	defer ch.phaseMu.Unlock()
+	if ch.Phase() >= PhaseDone {
 		return false
 	}
 	ch.Messages <- msg
 	return true
 }
 
-// WaitConnected blocks until the Python client for a run has connected,
-// or the context is cancelled.
+
+// WaitConnected blocks until the Python client connects, or returns an
+// already-closed channel if runID is unknown.
 func (s *GRPCServer) WaitConnected(runID string) <-chan struct{} {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
 	s.mu.RUnlock()
 	if !ok {
-		// Return already-closed channel
 		c := make(chan struct{})
 		close(c)
 		return c
@@ -187,14 +234,9 @@ func (s *GRPCServer) WaitConnected(runID string) <-chan struct{} {
 	return ch.connected
 }
 
-// WaitStreamDone blocks until the gRPC Execute() handler returns for the given run,
-// meaning all Python messages have been forwarded to the Messages channel.
-//
-// Short-circuits when the run never connected: streamDone is closed in
-// Execute()'s defer, so a Python that died before connecting would otherwise
-// burn the full timeout here for no reason. Callers invoke this from
-// waitForExit, AFTER proc.Wait() returned — by then the process is gone, so
-// "connected channel still open" reliably means "client never arrived."
+// WaitStreamDone blocks until Execute() returns for runID. Short-circuits
+// when the client never connected (callers invoke this after proc.Wait, so
+// "connected still open" reliably means "client never arrived").
 func (s *GRPCServer) WaitStreamDone(runID string, timeout time.Duration) {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
@@ -215,7 +257,7 @@ func (s *GRPCServer) WaitStreamDone(runID string, timeout time.Duration) {
 	}
 }
 
-// SendStart sends a StartRequest to the Python script for the given run.
+// SendStart delivers the StartRequest to runID's Python client.
 func (s *GRPCServer) SendStart(runID string, params map[string]string) error {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
@@ -235,7 +277,7 @@ func (s *GRPCServer) SendStart(runID string, params map[string]string) error {
 	})
 }
 
-// SendCancel sends a CancelRequest to the Python script for the given run.
+// SendCancel delivers a CancelRequest to runID's Python client.
 func (s *GRPCServer) SendCancel(runID string) error {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
@@ -255,10 +297,9 @@ func (s *GRPCServer) SendCancel(runID string) error {
 	})
 }
 
-// Execute handles a bidirectional gRPC stream from a Python client.
-// The runID is passed via gRPC metadata.
+// Execute handles the bidirectional stream from a Python client. runID is
+// passed via gRPC metadata.
 func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
-	// Extract runID from metadata
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if !ok {
 		return fmt.Errorf("missing metadata")
@@ -276,7 +317,7 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 		return fmt.Errorf("unknown run ID: %s", runID)
 	}
 	ch.stream = stream
-	ch.connectOnce.Do(func() { close(ch.connected) })
+	ch.transitionTo(PhaseConnected)
 	s.mu.Unlock()
 	defer close(ch.streamDone)
 
@@ -288,11 +329,9 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 		RunID:       runID,
 	})
 
-	// Read messages from Python
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			// stream end is the normal exit path; log-only via Info.
 			s.reservoir.Report(notify.Event{
 				Severity:    notify.SeverityInfo,
 				Persistence: notify.PersistenceOneShot,
@@ -317,18 +356,15 @@ func (s *GRPCServer) Execute(stream pb.PythonRunner_ExecuteServer) error {
 	}
 }
 
-// streamSend sends a ServerMessage on the gRPC stream, protected by streamMu.
 func (ch *RunChannel) streamSend(msg *pb.ServerMessage) error {
 	ch.streamMu.Lock()
 	defer ch.streamMu.Unlock()
 	return ch.stream.Send(msg)
 }
 
-// handleClientMessage dispatches a ClientMessage from a Python client to the
-// appropriate handler. Assumes wire-deserialized input — protobuf unmarshaling
-// always materializes oneof sub-messages as non-nil (empty oneof payloads become
-// zero-valued structs, not nil pointers). In-process callers must uphold the
-// same invariant.
+// handleClientMessage assumes wire-deserialized input: protobuf oneof
+// sub-messages are always materialized as non-nil structs (empty payloads
+// become zero values, not nil pointers).
 func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.ClientMessage, stream pb.PythonRunner_ExecuteServer) error {
 	switch m := msg.Msg.(type) {
 	case *pb.ClientMessage_Output:
@@ -340,16 +376,20 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Label:   m.Progress.Label,
 		})
 	case *pb.ClientMessage_Status:
-		// Python's StatusMsg is INPUT to Manager's status derivation, not a
-		// user-visible event. Manager.waitForExit reads these flags and emits
-		// the single authoritative run:status event. Do not forward to the
-		// channel — that would create a duplicate path to the frontend.
+		// Python's StatusMsg feeds Manager's status derivation only; do not
+		// forward to the channel or it would race the single authoritative
+		// run:status event Manager.waitForExit emits. First-write-wins —
+		// Python should send at most one terminal status per run.
+		var s RunStatus
 		switch m.Status.State {
 		case string(StatusCompleted):
-			ch.gotCompletedStatus.Store(true)
+			s = StatusCompleted
 		case string(StatusFailed):
-			ch.gotFailedStatus.Store(true)
+			s = StatusFailed
+		default:
+			return nil
 		}
+		ch.pythonStatus.CompareAndSwap(nil, &s)
 	case *pb.ClientMessage_Error:
 		ch.gotError.Store(true)
 		msg := m.Error.Message
@@ -589,8 +629,8 @@ func (s *GRPCServer) handleDbQuery(runID string, ch *RunChannel, req *pb.DbQuery
 	})
 }
 
-// TrySendError sends a synthetic ErrorMsg to a run's message channel.
-// Used to forward stderr output to the frontend when Python crashes without calling fail().
+// TrySendError synthesizes an ErrorMsg for the run, used when Python crashed
+// without calling fail() and the only signal is captured stderr.
 func (s *GRPCServer) TrySendError(runID, message string) {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
@@ -601,9 +641,9 @@ func (s *GRPCServer) TrySendError(runID, message string) {
 	ch.trySend(ErrorMsg{Message: message, Traceback: ""})
 }
 
-// TrySendStatus sends a final StatusMsg to a run's message channel.
-// Used by waitForExit to guarantee the frontend receives a terminal status
-// even if the Python→gRPC path failed to deliver one.
+// TrySendStatus delivers the final StatusMsg to runID's channel.
+// waitForExit uses this to guarantee a terminal status reaches the frontend
+// even when the Python→gRPC path didn't.
 func (s *GRPCServer) TrySendStatus(runID string, status RunStatus) {
 	s.mu.RLock()
 	ch, ok := s.runs[runID]
@@ -614,7 +654,6 @@ func (s *GRPCServer) TrySendStatus(runID string, status RunStatus) {
 	ch.trySend(StatusMsg{State: status})
 }
 
-// GotError returns whether the run received a structured error via gRPC.
 func (s *GRPCServer) GotError(runID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -625,29 +664,30 @@ func (s *GRPCServer) GotError(runID string) bool {
 	return ch.gotError.Load()
 }
 
-// GotFailedStatus returns whether the run received a "failed" StatusMsg via gRPC.
+// PythonReportedStatus returns the terminal status Python reported via
+// StatusMsg, or "" if none was reported. GotFailedStatus and
+// GotCompletedStatus are thin wrappers preserved for tests / external readers.
+func (s *GRPCServer) PythonReportedStatus(runID string) RunStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ch, ok := s.runs[runID]
+	if !ok {
+		return ""
+	}
+	if p := ch.pythonStatus.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 func (s *GRPCServer) GotFailedStatus(runID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ch, ok := s.runs[runID]
-	if !ok {
-		return false
-	}
-	return ch.gotFailedStatus.Load()
+	return s.PythonReportedStatus(runID) == StatusFailed
 }
 
-// GotCompletedStatus returns whether the run received a "completed" StatusMsg via gRPC.
 func (s *GRPCServer) GotCompletedStatus(runID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	ch, ok := s.runs[runID]
-	if !ok {
-		return false
-	}
-	return ch.gotCompletedStatus.Load()
+	return s.PythonReportedStatus(runID) == StatusCompleted
 }
 
-// ErrorMessage returns the last structured error message text received via gRPC, if any.
 func (s *GRPCServer) ErrorMessage(runID string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -661,7 +701,6 @@ func (s *GRPCServer) ErrorMessage(runID string) string {
 	return ""
 }
 
-// Stop gracefully shuts down the gRPC server.
 func (s *GRPCServer) Stop() {
 	s.server.GracefulStop()
 }

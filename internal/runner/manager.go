@@ -12,10 +12,8 @@ import (
 	"go-python-runner/internal/notify"
 )
 
-// maxStderrLog is the maximum number of bytes of stderr output to log.
 const maxStderrLog = 4096
 
-// RunStatus represents the lifecycle state of a script run.
 type RunStatus string
 
 const (
@@ -25,12 +23,10 @@ const (
 	StatusCancelled RunStatus = "cancelled"
 )
 
-// IsTerminal returns true if the status represents a final state.
 func (s RunStatus) IsTerminal() bool {
 	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
 }
 
-// RunState tracks the state of a single script execution.
 type RunState struct {
 	RunID    string
 	ScriptID string
@@ -38,15 +34,12 @@ type RunState struct {
 	process  *Process
 	messages <-chan Message
 	cancel   func()
-	// cancelRequested is set by CancelRun under Manager.mu and read by
-	// deriveFinalStatus to override the final status to StatusCancelled
-	// regardless of how the process exits or what Python signals. This is
-	// the single structural fact that distinguishes user-driven cancel
-	// from genuine failure.
+	// cancelRequested is the single structural fact that distinguishes
+	// user-driven cancellation from genuine failure; deriveFinalStatus reads
+	// it to force StatusCancelled regardless of exit code or Python's signal.
 	cancelRequested bool
 }
 
-// RunRecord is a completed run entry for history.
 type RunRecord struct {
 	RunID     string
 	ScriptID  string
@@ -55,7 +48,6 @@ type RunRecord struct {
 	EndedAt   time.Time
 }
 
-// Manager orchestrates Python script execution.
 type Manager struct {
 	mu         sync.RWMutex
 	activeRuns map[string]*RunState
@@ -64,14 +56,10 @@ type Manager struct {
 	cache      *CacheManager
 	db         *db.DB
 	reservoir  notify.Reservoir
-	PythonPath string // optional override for python path
-	LibDir     string // path to scripts/_lib (prepended to PYTHONPATH for spawned scripts)
+	PythonPath string
+	LibDir     string
 }
 
-// NewManager creates a new process manager.
-// If store is non-nil, persisted run history is loaded from SQLite.
-// The reservoir is the sole observability dependency — every trace, warn,
-// and error event flows through reservoir.Report.
 func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, reservoir notify.Reservoir) *Manager {
 	mgr := &Manager{
 		activeRuns: make(map[string]*RunState),
@@ -86,7 +74,6 @@ func NewManager(grpc *GRPCServer, cache *CacheManager, store *db.DB, reservoir n
 	return mgr
 }
 
-// loadHistory populates the in-memory history slice from the SQLite runs table.
 func (m *Manager) loadHistory() {
 	rows, err := m.db.Query(
 		"SELECT id, script_id, status, started_at, finished_at FROM runs " +
@@ -124,16 +111,14 @@ func (m *Manager) loadHistory() {
 	}
 }
 
-// StartRun starts a Python script and returns the runID and a message channel.
-// The caller should read from the channel to receive typed messages from the script.
+// StartRun spawns a Python script and returns the runID plus the channel
+// that carries typed messages from the script.
 func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir string) (string, <-chan Message, error) {
 	runID := uuid.New().String()
 	startedAt := time.Now()
 
-	// Register run with gRPC server to get message channel
 	msgCh := m.grpc.RegisterRun(runID)
 
-	// Create and start the process
 	proc := NewProcess(runID, scriptDir, m.LibDir, params, m.grpc.Addr())
 	proc.PythonPath = m.PythonPath
 	if err := proc.Start(); err != nil {
@@ -165,9 +150,8 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 		ScriptID:    scriptID,
 	})
 
-	// Persist initial run record to SQLite for history across restarts.
 	if m.db != nil {
-		paramsJSON, _ := json.Marshal(params)
+		paramsJSON, _ := json.Marshal(params) //nolint:errcheck // map[string]string never fails to marshal
 		if _, err := m.db.Exec(
 			"INSERT INTO runs (id, script_id, status, params, started_at) VALUES (?, ?, ?, ?, ?)",
 			runID, scriptID, string(StatusRunning), string(paramsJSON), startedAt,
@@ -190,23 +174,16 @@ func (m *Manager) StartRun(scriptID string, params map[string]string, scriptDir 
 	return runID, msgCh, nil
 }
 
-// connectTimeout is the maximum time to wait for a Python script to connect via gRPC.
 const connectTimeout = 30 * time.Second
-
-// cancelGracePeriod is the time to wait for a script to exit gracefully after
-// receiving a CancelRequest before force-killing the process.
 const cancelGracePeriod = 3 * time.Second
 
-// waitAndSendStart waits for the Python script to connect, then sends start params.
-// Bails early if the process exits or is cancelled before connecting — otherwise
-// a cancelled-before-connect run would leak this goroutine for a full
-// connectTimeout (30s).
+// waitAndSendStart waits for Python to connect, then sends StartRequest.
+// Bails on proc.Done so a cancelled-before-connect run doesn't leak this
+// goroutine for the full connectTimeout.
 func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc *Process) {
 	select {
 	case <-m.grpc.WaitConnected(runID):
 	case <-proc.Done():
-		// Process exited or was cancelled before Python connected.
-		// Nothing to send; waitForExit handles the cleanup path.
 		return
 	case <-time.After(connectTimeout):
 		m.reservoir.Report(notify.Event{
@@ -234,14 +211,9 @@ func (m *Manager) waitAndSendStart(runID string, params map[string]string, proc 
 	}
 }
 
-// deriveFinalStatus is Manager's authoritative status decision for a finished run.
-// See the trust-order comment in waitForExit for the rule list.
+// deriveFinalStatus is the authoritative terminal-status decision. The trust
+// order is documented at the call site in waitForExit.
 func (m *Manager) deriveFinalStatus(runID string, exitCode int, waitErr error) RunStatus {
-	// Rule 0: user-driven cancellation overrides everything below. A
-	// cancelled run is not a failure — even if the kill produced a non-zero
-	// exit, even if Python's cooperative cancel path called fail(), the
-	// terminal state is StatusCancelled. This is the single fact that
-	// keeps cancellation from being conflated with failure downstream.
 	if m.WasCancelled(runID) {
 		return StatusCancelled
 	}
@@ -257,17 +229,10 @@ func (m *Manager) deriveFinalStatus(runID string, exitCode int, waitErr error) R
 	if m.grpc.GotCompletedStatus(runID) {
 		return StatusCompleted
 	}
-	// Process exited 0 but Python signaled neither completion nor failure.
-	// Treat as a failure so users see a problem rather than a silent
-	// "completed" for a script that crashed before reaching complete()/fail().
+	// Exit 0 with no signal — script crashed before reaching complete()/fail().
 	return StatusFailed
 }
 
-// WasCancelled reports whether CancelRun has been called for this run. Used
-// by RunnerService.forwardMessages to demote in-flight ErrorMsgs from
-// cancelled runs to log-only routing (Python's cooperative-cancel path
-// emits fail("Cancelled by user"), which would otherwise surface as a
-// per-run error pane).
 func (m *Manager) WasCancelled(runID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -277,11 +242,8 @@ func (m *Manager) WasCancelled(runID string) bool {
 	return false
 }
 
-// RegisterActiveRunForTest installs a minimal RunState in the activeRuns map
-// without spawning a Python process. Test-only — production code only adds
-// to activeRuns via StartRun. Cross-package tests (e.g. RunnerService unit
-// tests in internal/services) need this to exercise WasCancelled / CancelRun
-// against a Manager without a live subprocess.
+// RegisterActiveRunForTest installs a minimal RunState without spawning a
+// subprocess. Test-only.
 func (m *Manager) RegisterActiveRunForTest(runID, scriptID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -293,16 +255,10 @@ func (m *Manager) RegisterActiveRunForTest(runID, scriptID string) {
 	}
 }
 
-// GRPCServer returns the underlying gRPC server. Test-only accessor used by
-// cross-package tests to register/unregister run channels without spawning
-// a Python subprocess. Production code reaches the gRPC server through
-// constructor injection, not this getter.
+// GRPCServer is a test-only accessor.
 func (m *Manager) GRPCServer() *GRPCServer { return m.grpc }
 
-// History returns a snapshot of completed-run records, newest first by index
-// of insertion. Used by integration / stress tests that need to assert
-// terminal state without relying on the gRPC server's per-run channels
-// (which are unregistered as soon as a run completes).
+// History returns a snapshot of completed-run records, in insertion order.
 func (m *Manager) History() []RunRecord {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -311,35 +267,31 @@ func (m *Manager) History() []RunRecord {
 	return out
 }
 
-// waitForExit waits for the process to exit, logs stderr if needed, and records the run.
+// waitForExit reaps the subprocess and emits the single terminal run:status.
+// Manager is the sole emitter; Python's StatusMsg is folded into atomic flags
+// by the gRPC handler and never reaches the frontend on its own.
+//
+// Trust order for deriveFinalStatus:
+//
+//	0. cancelRequested        → Cancelled (overrides everything)
+//	1. process exited non-zero → Failed
+//	2. Python sent ErrorMsg    → Failed
+//	3. Python sent Status(failed) without ErrorMsg → Failed
+//	4. Python sent Status(completed) → Completed
+//	5. otherwise               → Failed (script exited 0 without signaling)
 func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc *Process) {
 	exitCode, stderrOutput, err := proc.Wait()
 	endedAt := time.Now()
 
-	// Wait for gRPC stream to fully close so all Python messages
-	// (progress, error, status) are delivered before we synthesize a final status.
+	// Drain remaining Python messages before synthesizing the final status.
 	m.grpc.WaitStreamDone(runID, 5*time.Second)
 
-	// Manager is the SOLE authority on terminal run status. Python's StatusMsg
-	// is consumed as a flag (gotCompletedStatus / gotFailedStatus) by the gRPC
-	// handler and never reaches the frontend on its own — this method emits
-	// exactly one run:status event below.
-	//
-	// Trust order:
-	//   0. cancelRequested flag     → Cancelled (user-driven; not a failure, overrides everything below)
-	//   1. process exited non-zero  → Failed   (process crashed; ignore Python's intent)
-	//   2. gotError flag            → Failed   (Python called fail())
-	//   3. gotFailedStatus flag     → Failed   (Python sent Status(failed) without ErrorMsg)
-	//   4. gotCompletedStatus flag  → Completed (Python called complete())
-	//   5. otherwise                → Failed   (script exited cleanly without signaling — bug in script)
 	finalStatus := m.deriveFinalStatus(runID, exitCode, err)
 
 	if finalStatus == StatusFailed && exitCode != 0 && stderrOutput != "" && !m.grpc.GotError(runID) {
-		// Process crashed without sending a structured error. Route the
-		// captured stderr through the reservoir so the per-run pane (via
-		// run:error) and LogViewer (via slog) both see it through the same
-		// single ingress as structured errors. Persistence is InFlight so
-		// the routing matches a Python-originated fail() exactly.
+		// Crash without a structured error — route stderr through the
+		// reservoir as InFlight so it appears in the per-run pane like a
+		// Python-originated fail() would.
 		logStderr := stderrOutput
 		if len(logStderr) > maxStderrLog {
 			logStderr = logStderr[:maxStderrLog] + "\n... (truncated)"
@@ -356,12 +308,10 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 		})
 	}
 
-	// Sole emitter of run:status — frontend is guaranteed to receive exactly
-	// one terminal status event per run.
 	m.grpc.TrySendStatus(runID, finalStatus)
 
-	// Capture structured error message before UnregisterRun clears the RunChannel.
-	// Priority: stderr (unstructured crash) > gRPC ErrorMsg (structured fail()) > process error.
+	// Capture before UnregisterRun clears the RunChannel.
+	// Priority: stderr > gRPC ErrorMsg > process error.
 	var errorMessage string
 	if finalStatus == StatusFailed {
 		if stderrOutput != "" {
@@ -405,7 +355,6 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	})
 	m.mu.Unlock()
 
-	// Update the persistent run record in SQLite.
 	if m.db != nil {
 		if _, dbErr := m.db.Exec(
 			"UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error_message = ? WHERE id = ?",
@@ -433,11 +382,8 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	})
 }
 
-// CancelAll cancels every active run. Used at shutdown so grpc.GracefulStop
-// doesn't block on Python scripts that are happy to keep running for tens of
-// seconds (cache_produce, polling loops). Snapshots run IDs under the lock,
-// then issues cancels outside it — CancelRun reacquires the lock per call,
-// so holding mu across the whole loop would deadlock.
+// CancelAll cancels every active run. Snapshots ids outside the lock because
+// CancelRun reacquires it per call.
 func (m *Manager) CancelAll() {
 	m.mu.RLock()
 	ids := make([]string, 0, len(m.activeRuns))
@@ -447,16 +393,13 @@ func (m *Manager) CancelAll() {
 	m.mu.RUnlock()
 
 	for _, id := range ids {
-		// Ignore ErrRunNotActive — race with organic completion is fine.
-		_ = m.CancelRun(id)
+		_ = m.CancelRun(id) //nolint:errcheck // race with organic completion is fine
 	}
 }
 
-// CancelRun cancels a running script. Returns ErrRunNotActive if the run
-// is not in activeRuns (already terminal, or never registered) — that
-// sentinel is filtered by CancelGroup so partial group cancels don't
-// produce spurious "did not cancel" toasts for siblings that already
-// completed or errored organically.
+// CancelRun cancels a running script. Returns ErrRunNotActive when the run
+// is no longer in activeRuns; CancelGroup filters that sentinel so siblings
+// that completed organically don't produce spurious "did not cancel" toasts.
 func (m *Manager) CancelRun(runID string) error {
 	m.mu.Lock()
 	state, ok := m.activeRuns[runID]
@@ -467,10 +410,8 @@ func (m *Manager) CancelRun(runID string) error {
 	state.cancelRequested = true
 	m.mu.Unlock()
 
-	// Try to send cancel via gRPC first. If it fails, kill immediately.
-	// If it succeeds, give the script a grace window to exit cleanly.
+	// Try cooperative cancel first; on gRPC failure kill immediately.
 	if err := m.grpc.SendCancel(runID); err != nil {
-		// Cancel-path failures are deep-trace; log-only via Info.
 		m.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityInfo,
 			Persistence: notify.PersistenceOneShot,
@@ -480,9 +421,7 @@ func (m *Manager) CancelRun(runID string) error {
 		})
 		state.cancel()
 	} else {
-		// Grace window: let the script notice is_cancelled() and exit cleanly.
-		// If it doesn't exit in time, force-kill. cancel() is idempotent — if
-		// the process already exited via waitForExit, this is a no-op.
+		// Grace window for is_cancelled() to exit cleanly; force-kill after.
 		time.AfterFunc(cancelGracePeriod, state.cancel)
 	}
 	m.reservoir.Report(notify.Event{

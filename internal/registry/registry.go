@@ -79,10 +79,8 @@ type Registry struct {
 	reservoir   notify.Reservoir
 }
 
-// New creates a new Registry. The reservoir is the sole observability
-// dependency — every LoadIssue produces an ongoing banner via
-// ReplaceBannersByPrefix on each load, and plugin-override warnings flow
-// through reservoir.Report.
+// New creates a Registry. Each load publishes the current LoadIssue set as
+// ongoing banners via ReplaceBannersByPrefix.
 func New(reservoir notify.Reservoir) *Registry {
 	return &Registry{
 		scripts:   make(map[string]Script),

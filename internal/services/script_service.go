@@ -13,25 +13,18 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// pathOpener is the OS-level open hook. Tests override this to avoid actually
-// invoking the user's default editor / file manager.
 type pathOpener func(string) error
 
-// ScriptService is a Wails service that exposes script information to the frontend.
 type ScriptService struct {
 	registry    *registry.Registry
 	reservoir   notify.Reservoir
 	app         atomic.Pointer[application.App]
-	allowedRoot []string   // absolute, normalized roots that OpenPath will permit
-	openHook    pathOpener // injectable opener; defaults to app.Browser.OpenFile once SetApp wires the app
+	allowedRoot []string   // absolute, normalized; bounds OpenPath
+	openHook    pathOpener // tests inject; SetApp installs app.Browser.OpenFile
 }
 
-// NewScriptService creates a new ScriptService. allowedRoots are absolute paths
-// that bound which paths OpenPath will open — defense-in-depth against a
-// compromised frontend requesting arbitrary filesystem paths.
-//
-// reservoir is the sole observability dependency; every user-visible error
-// from this service flows through reservoir.Report.
+// NewScriptService creates a ScriptService. allowedRoots bound which paths
+// OpenPath will open — defense-in-depth against a compromised frontend.
 func NewScriptService(reg *registry.Registry, reservoir notify.Reservoir, allowedRoots ...string) *ScriptService {
 	roots := make([]string, 0, len(allowedRoots))
 	for _, r := range allowedRoots {
@@ -51,10 +44,6 @@ func NewScriptService(reg *registry.Registry, reservoir notify.Reservoir, allowe
 	}
 }
 
-// SetApp wires the Wails app reference for emitting scripts:changed events.
-// Called after app initialization, alongside RunnerService/LogService SetApp.
-// Also sets the default OpenPath hook to app.Browser.OpenFile if a test
-// hasn't already overridden it.
 func (s *ScriptService) SetApp(app *application.App) {
 	s.app.Store(app)
 	if s.openHook == nil {
@@ -62,8 +51,7 @@ func (s *ScriptService) SetApp(app *application.App) {
 	}
 }
 
-// NotifyChanged emits the scripts:changed Wails event so the frontend re-fetches
-// the catalog. Called by the registry watcher when a Reload yielded changed=true.
+// NotifyChanged emits scripts:changed so the frontend re-fetches the catalog.
 func (s *ScriptService) NotifyChanged() {
 	if app := s.app.Load(); app != nil {
 		app.Event.Emit("scripts:changed", nil)
@@ -76,20 +64,16 @@ func (s *ScriptService) NotifyChanged() {
 	})
 }
 
-// ListScripts returns all registered scripts in deterministic order.
 func (s *ScriptService) ListScripts() []registry.Script {
 	return s.registry.List()
 }
 
-// ListIssues returns the current set of script load failures so the frontend
-// can render a persistent banner. Read-only; can't fail.
 func (s *ScriptService) ListIssues() []registry.LoadIssue {
 	return s.registry.Issues()
 }
 
-// OpenPath opens a script file or directory in the OS default handler
-// (editor for files, file manager for directories). Restricted to paths
-// under the configured allowed roots.
+// OpenPath opens absPath in the OS default handler. Restricted to paths under
+// the configured allowed roots.
 func (s *ScriptService) OpenPath(absPath string) error {
 	clean := filepath.Clean(absPath)
 	if !s.isAllowedPath(clean) {
@@ -137,8 +121,6 @@ func (s *ScriptService) OpenPath(absPath string) error {
 	return nil
 }
 
-// isAllowedPath reports whether clean is within any of the allowed roots.
-// Both inputs are expected to be absolute and filepath.Clean'd.
 func (s *ScriptService) isAllowedPath(clean string) bool {
 	if len(s.allowedRoot) == 0 {
 		return false

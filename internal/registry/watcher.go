@@ -32,10 +32,8 @@ type Watcher struct {
 	reservoir  notify.Reservoir
 }
 
-// NewWatcher constructs a Watcher. onChange must not be nil; pass a no-op if
-// you genuinely don't need to react to changes (the Reload still happens).
-// The reservoir is the sole observability dependency — fsnotify failures
-// and reload errors flow through reservoir.Report.
+// NewWatcher constructs a Watcher. onChange must not be nil; pass a no-op
+// when you only want the Reload to happen.
 func NewWatcher(reg *Registry, builtinDir, pluginDir string, onChange func(), reservoir notify.Reservoir) *Watcher {
 	return &Watcher{
 		reg:        reg,
@@ -152,7 +150,6 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if ev.Op&fsnotify.Create != 0 {
 				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
 					if addErr := fsw.Add(ev.Name); addErr != nil && !errors.Is(addErr, fsnotify.ErrEventOverflow) {
-						// Per-dir watch failure is a deep-trace event; log-only via Info.
 						w.reservoir.Report(notify.Event{
 							Severity:    notify.SeverityInfo,
 							Persistence: notify.PersistenceOneShot,
@@ -200,7 +197,6 @@ func (w *Watcher) addRecursive(fsw *fsnotify.Watcher, dir string) error {
 			return filepath.SkipDir
 		}
 		if addErr := fsw.Add(path); addErr != nil {
-			// Per-dir watch failure is a deep-trace event; log-only via Info.
 			w.reservoir.Report(notify.Event{
 				Severity:    notify.SeverityInfo,
 				Persistence: notify.PersistenceOneShot,

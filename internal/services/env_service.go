@@ -19,9 +19,6 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// EnvInfo describes the venv the running app is using. Surfaced unchanged
-// to the frontend; ToolName drives which CLI EnvService shells out to,
-// Editable controls whether install/uninstall buttons are shown.
 type EnvInfo struct {
 	PythonPath    string `json:"pythonPath"`
 	PythonVersion string `json:"pythonVersion"`
@@ -30,33 +27,49 @@ type EnvInfo struct {
 	Editable      bool   `json:"editable"`
 }
 
-// Package is one row of `pip list --format=json`.
 type Package struct {
 	Name    string `json:"name"`
 	Version string `json:"version"`
 }
 
-// EnvService is a Wails service that inspects and mutates the venv the
-// running app resolved. Install/uninstall serialize through a mutex to
-// prevent pip lock-file races; ListPackages is lock-free.
+// EnvService inspects and mutates the resolved venv. Install/uninstall
+// serialize via s.op CAS; ListPackages is lock-free.
 type EnvService struct {
 	info        EnvInfo
-	mu          sync.Mutex
-	busy        atomic.Bool
-	app         atomic.Pointer[application.App]
+	op          atomic.Int32 // envOpState
 	reservoir   notify.Reservoir
-	commandHook commandHook // injectable for tests; nil → real exec
+	app         atomic.Pointer[application.App]
+	commandHook commandHook
 }
 
-// commandHook lets tests inject a fake exec.CommandContext. Production code
-// uses the default (nil) which falls back to exec.CommandContext.
 type commandHook func(ctx context.Context, name string, args ...string) *exec.Cmd
 
-// NewEnvService probes the resolved venv and the available tooling. Returns
-// an error only if there's no venv at all; an unwritable venv yields a
-// service with Editable=false (install/uninstall still callable, but they
-// fail-fast with a clear error). The reservoir is the sole observability
-// dependency.
+const (
+	envOpIdle    int32 = 0
+	envOpRunning int32 = 1
+)
+
+// tryEnter atomically transitions idle → running and emits env:operation:start
+// inside the transition so observers see EnvBusy()=true and the start event in
+// agreement. Returns false if another op is already in flight.
+func (s *EnvService) tryEnter(op, spec string) bool {
+	if !s.op.CompareAndSwap(envOpIdle, envOpRunning) {
+		return false
+	}
+	s.emit("env:operation:start", map[string]any{"op": op, "spec": spec})
+	return true
+}
+
+// exit emits env:operation:end and transitions running → idle. Pairs with
+// tryEnter; must only be called after a successful tryEnter.
+func (s *EnvService) exit(op, spec string) {
+	s.emit("env:operation:end", map[string]any{"op": op, "spec": spec})
+	s.op.Store(envOpIdle)
+}
+
+// NewEnvService probes the venv and tooling. Returns an error only if there
+// is no venv at all; an unwritable venv yields Editable=false and the
+// install/uninstall paths fail-fast with a clear error.
 func NewEnvService(reservoir notify.Reservoir) (*EnvService, error) {
 	venv, err := runner.FindVenv()
 	if err != nil {
@@ -74,8 +87,7 @@ func NewEnvService(reservoir notify.Reservoir) (*EnvService, error) {
 		ToolName:   toolName,
 		Editable:   venv.Editable,
 	}
-	// Best-effort version probe. Failures don't block service creation —
-	// the version is informational, not load-bearing.
+	// Best-effort version probe; informational only.
 	{
 		probe := exec.Command(venv.Python, "--version")
 		runner.HideConsole(probe)
@@ -95,28 +107,20 @@ func NewEnvService(reservoir notify.Reservoir) (*EnvService, error) {
 	return &EnvService{info: info, reservoir: reservoir}, nil
 }
 
-// SetApp wires the Wails app reference for emitting env:operation:* events.
-// Same lifecycle as RunnerService/LogService/ScriptService SetApp.
 func (s *EnvService) SetApp(app *application.App) {
 	s.app.Store(app)
 }
 
-// GetEnvInfo returns the resolved venv summary. Used by the EnvironmentPane
-// header and by any caller that needs to know which Python is active.
 func (s *EnvService) GetEnvInfo() EnvInfo {
 	return s.info
 }
 
-// EnvBusy reports whether an install/uninstall is currently in flight. The
-// frontend uses this for an immediate guard on the UI, but the source of
-// truth for "are we busy" is the env:operation:start / env:operation:end
-// event pair.
+// EnvBusy reports whether an install/uninstall is in flight. Reads the same
+// state that env:operation:start / env:operation:end events transition.
 func (s *EnvService) EnvBusy() bool {
-	return s.busy.Load()
+	return s.op.Load() == envOpRunning
 }
 
-// ListPackages parses `pip list --format=json` (or `uv pip list` equivalent)
-// into typed records. No lock; pip list is read-only.
 func (s *EnvService) ListPackages() ([]Package, error) {
 	args := s.cmdArgs("list", "--format=json")
 	out, err := s.runCapture(args)
@@ -146,9 +150,8 @@ func (s *EnvService) ListPackages() ([]Package, error) {
 	return pkgs, nil
 }
 
-// InstallPackage installs a single package spec (e.g. "pandas",
-// "numpy>=2.0", "git+https://..."). Streamed pip output is forwarded as
-// env:operation:log events; the final result is captured by env:operation:end.
+// InstallPackage installs a single spec (e.g. "pandas", "numpy>=2.0",
+// "git+https://..."). Output streams as env:operation:log events.
 func (s *EnvService) InstallPackage(spec, indexURL string) error {
 	if spec == "" {
 		err := errors.New("install spec cannot be empty")
@@ -178,9 +181,8 @@ func (s *EnvService) InstallPackage(spec, indexURL string) error {
 }
 
 // InstallRequirements installs from a requirements.txt at absPath. The path
-// is validated to exist and be a regular file before pip is invoked, so
-// missing-file errors surface as clean Go errors rather than confusing pip
-// stack traces.
+// is validated before pip runs so missing-file errors surface cleanly rather
+// than as a pip stack trace.
 func (s *EnvService) InstallRequirements(absPath, indexURL string) error {
 	if absPath == "" {
 		err := errors.New("requirements path cannot be empty")
@@ -233,7 +235,6 @@ func (s *EnvService) InstallRequirements(absPath, indexURL string) error {
 	return s.runInstall("install -r", absPath, indexURL, []string{"-r", absPath})
 }
 
-// UninstallPackage removes a single package by name.
 func (s *EnvService) UninstallPackage(name string) error {
 	if name == "" {
 		err := errors.New("package name cannot be empty")
@@ -267,13 +268,11 @@ func (s *EnvService) UninstallPackage(name string) error {
 	return s.runInstall("uninstall", name, "", append([]string{"uninstall"}, pkgArgs...))
 }
 
-// runInstall is the streamed-output execution path used by Install /
-// InstallRequirements / UninstallPackage. It serializes through s.mu so two
-// concurrent operations can't fight over the venv lock file. The
-// env:operation:start/end emits are lifecycle signals (busy state) — error
-// reporting goes through the reservoir, not the emit payload.
+// runInstall is the streamed-output path shared by install / install -r /
+// uninstall. env:operation:start/end are lifecycle signals; errors flow
+// through the reservoir.
 func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) error {
-	if !s.mu.TryLock() {
+	if !s.tryEnter(op, spec) {
 		err := errors.New("another install/uninstall is already in flight")
 		s.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityError,
@@ -285,12 +284,9 @@ func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) erro
 		})
 		return err
 	}
-	defer s.mu.Unlock()
-	s.busy.Store(true)
-	defer s.busy.Store(false)
+	defer s.exit(op, spec)
 
-	// Build the full command. opArgs already contains the verb for uninstall;
-	// for install we add "install" + the spec args.
+	// opArgs already contains the verb for uninstall; install prepends it.
 	var cmdArgs []string
 	if strings.HasPrefix(op, "install") {
 		cmdArgs = []string{"install"}
@@ -303,12 +299,8 @@ func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) erro
 	}
 
 	args := s.cmdArgs(cmdArgs...)
-	s.emit("env:operation:start", map[string]any{"op": op, "spec": spec})
 
 	runErr := s.runStreamed(args)
-	// Lifecycle signal fires unconditionally so the frontend flips busy state
-	// in both success and failure paths. Errors flow through the reservoir.
-	s.emit("env:operation:end", map[string]any{"op": op, "spec": spec})
 	if runErr != nil {
 		s.reservoir.Report(notify.Event{
 			Severity:    notify.SeverityError,
@@ -329,12 +321,10 @@ func (s *EnvService) runInstall(op, spec, indexURL string, opArgs []string) erro
 	return nil
 }
 
-// cmdArgs returns the argv prefix appropriate to the resolved tool.
+// cmdArgs returns the argv prefix for the resolved tool:
 //
-//	uv:  uv pip <op> --python <python>
-//	pip: <python> -m pip <op>
-//
-// Caller passes the operation tail (e.g. "install", "pandas").
+//	uv:  uv pip <tail...> --python <python>
+//	pip: <python> -m pip <tail...>
 func (s *EnvService) cmdArgs(tail ...string) []string {
 	switch s.info.ToolName {
 	case "uv":
@@ -344,8 +334,8 @@ func (s *EnvService) cmdArgs(tail ...string) []string {
 	}
 }
 
-// runCapture executes argv synchronously and returns its combined stdout.
-// stderr is also captured; on non-zero exit, both are folded into the error.
+// runCapture runs argv and returns stdout. On non-zero exit, stderr is
+// folded into the error.
 func (s *EnvService) runCapture(argv []string) ([]byte, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("empty argv")
@@ -356,13 +346,13 @@ func (s *EnvService) runCapture(argv []string) ([]byte, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s", err.Error(), strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return out, nil
 }
 
-// runStreamed executes argv and forwards stdout+stderr line-by-line as
-// env:operation:log events. Returns the exit error, if any.
+// runStreamed runs argv and forwards stdout+stderr line-by-line as
+// env:operation:log events.
 func (s *EnvService) runStreamed(argv []string) error {
 	if len(argv) == 0 {
 		return errors.New("empty argv")
@@ -390,8 +380,6 @@ func (s *EnvService) runStreamed(argv []string) error {
 	return cmd.Wait()
 }
 
-// forwardLines reads r line-by-line, emitting one env:operation:log event
-// per line. EOF and read errors end the loop cleanly.
 func (s *EnvService) forwardLines(r io.Reader, stream string) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -400,9 +388,9 @@ func (s *EnvService) forwardLines(r io.Reader, stream string) {
 	}
 }
 
-// command returns an *exec.Cmd, optionally constructed via the test hook.
-// Always suppresses the per-subprocess console window on Windows; the Wails
-// app is a -H windowsgui binary, so any flash console would be visible.
+// command returns an *exec.Cmd via the test hook if set, otherwise
+// exec.CommandContext. HideConsole suppresses the flash console on Windows
+// (the Wails app is -H windowsgui).
 func (s *EnvService) command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if s.commandHook != nil {
@@ -414,8 +402,6 @@ func (s *EnvService) command(ctx context.Context, name string, args ...string) *
 	return cmd
 }
 
-// emit forwards a payload to the Wails frontend if the app is wired up.
-// No-op pre-SetApp (during boot, before app.Run).
 func (s *EnvService) emit(event string, payload any) {
 	if app := s.app.Load(); app != nil {
 		app.Event.Emit(event, payload)

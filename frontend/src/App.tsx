@@ -7,9 +7,7 @@ import NotificationStack from './components/NotificationStack'
 import { NotificationsProvider } from './hooks/useNotifications'
 import { useNotifyChannel } from './hooks/useNotifyChannel'
 
-// NotifyChannelMount mounts useNotifyChannel inside the NotificationsProvider
-// so the central router has access to addNotification / dismissByKey /
-// replaceOngoingBanners. Renders nothing — it's just an effect host.
+// Effect host so useNotifyChannel runs inside NotificationsProvider.
 function NotifyChannelMount() {
   useNotifyChannel()
   return null
@@ -61,10 +59,6 @@ function App() {
   const [tab, setTab] = useState<Tab>('tasks')
   const [showLogs, setShowLogs] = useState(false)
 
-  // Tier guide (Frontend "shows", Go "manages"):
-  //   - Transient (action failed, app fine)        → toast via NotificationStack
-  //   - Persistent (feature broken, app usable)    → inline banner in the affected pane
-  //   - Catastrophic (app cannot function)         → ErrorBoundary fallback or loadError pane in TaskGrid
   return (
     <ErrorBoundary>
       <NotificationsProvider>

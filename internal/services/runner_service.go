@@ -6,48 +6,37 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/google/uuid"
-	"github.com/wailsapp/wails/v3/pkg/application"
-
 	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 	"go-python-runner/internal/runner"
+
+	"github.com/google/uuid"
+	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
-// ParallelRunsResult is the typed return of StartParallelRuns. The GroupID
-// identifies the batch on the frontend; RunIDs are the individual workers
-// in the order they were spawned.
 type ParallelRunsResult struct {
 	GroupID string   `json:"groupID"`
 	RunIDs  []string `json:"runIDs"`
 }
 
-// runGroup tracks the membership of a parallel-run batch. The frontend uses
-// the GroupID to render an aggregate progress bar over the children.
 type runGroup struct {
 	GroupID  string
 	ScriptID string
-	RunIDs   []string // immutable after Register
+	RunIDs   []string
 }
 
-// RunnerService is a Wails service that manages script execution.
 type RunnerService struct {
 	manager   *runner.Manager
 	registry  *registry.Registry
 	reservoir notify.Reservoir
-	app       atomic.Pointer[application.App] // set after Wails init, read from goroutines
+	app       atomic.Pointer[application.App]
 
-	// Group registry for parallel runs. Manager is run-level; group is a
-	// batch-level construct owned here so Manager stays group-unaware.
+	// Group is a batch-level construct owned here so Manager stays group-unaware.
 	groupsMu  sync.Mutex
-	groups    map[string]*runGroup // groupID -> group
-	runGroups map[string]string    // runID  -> groupID (reverse lookup)
+	groups    map[string]*runGroup
+	runGroups map[string]string
 }
 
-// NewRunnerService creates a new RunnerService. The reservoir is the sole
-// observability dependency — every user-visible error and trace event flows
-// through reservoir.Report, including script output and data-result traces
-// (which route to log-only via Severity=Info + Persistence=OneShot).
 func NewRunnerService(mgr *runner.Manager, reg *registry.Registry, reservoir notify.Reservoir) *RunnerService {
 	return &RunnerService{
 		manager:   mgr,
@@ -58,13 +47,10 @@ func NewRunnerService(mgr *runner.Manager, reg *registry.Registry, reservoir not
 	}
 }
 
-// SetApp sets the Wails app reference for emitting events.
-// Called after app initialization.
 func (s *RunnerService) SetApp(app *application.App) {
 	s.app.Store(app)
 }
 
-// StartRun starts a script and returns the run ID.
 func (s *RunnerService) StartRun(scriptID string, params map[string]string) (string, error) {
 	script, ok := s.registry.Get(scriptID)
 	if !ok {
@@ -96,18 +82,14 @@ func (s *RunnerService) StartRun(scriptID string, params map[string]string) (str
 		return "", wrapped
 	}
 
-	// Goroutine: read messages from the channel and emit Wails events.
-	// Empty groupID => the run is not part of a parallel group.
 	go s.forwardMessages(runID, scriptID, "", msgCh)
 
 	return runID, nil
 }
 
-// StartParallelRuns starts multiple instances of a parallel-capable script.
-// Each instance gets a unique name via the script's VaryParam and is chained
-// via ChainParam so that worker[i] reads from worker[i-1]. The returned
-// GroupID identifies the batch on the frontend so it can render an aggregate
-// progress bar over the workers.
+// StartParallelRuns spawns workerCount instances of a parallel-capable script.
+// Each worker gets a unique VaryParam name; ChainParam wires worker[i] to read
+// from worker[i-1].
 func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]string, workerCount int) (ParallelRunsResult, error) {
 	script, ok := s.registry.Get(scriptID)
 	if !ok {
@@ -145,9 +127,6 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 		workerCount = pc.MaxWorkers
 	}
 
-	// One canonical name resolver. Used both for the worker's own name and for
-	// the chain link to its predecessor, so the Names[]/Worker-N fallback is
-	// expressed exactly once.
 	nameForIndex := func(idx int) string {
 		if idx < len(pc.Names) {
 			return pc.Names[idx]
@@ -178,10 +157,6 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 
 		runID, msgCh, err := s.manager.StartRun(scriptID, wp, script.Dir)
 		if err != nil {
-			// Cancel already-started runs on failure. Each rollback failure is
-			// surfaced individually (toast) AND folded into the joined error
-			// returned to the frontend — no silent slog.Warn that the user
-			// can't see. See CLAUDE.md § Cascading failures.
 			primary := fmt.Errorf("starting worker %d for %s: %w", i, scriptID, err)
 			s.reservoir.Report(notify.Event{
 				Severity:    notify.SeverityError,
@@ -217,21 +192,17 @@ func (s *RunnerService) StartParallelRuns(scriptID string, params map[string]str
 		runIDs = append(runIDs, runID)
 	}
 
-	// Commit group registration only after every worker spawned successfully.
-	// On partial failure we already rolled back via CancelRun above.
 	s.registerGroup(groupID, scriptID, runIDs)
 
 	return ParallelRunsResult{GroupID: groupID, RunIDs: runIDs}, nil
 }
 
-// CancelRun cancels a running script.
 func (s *RunnerService) CancelRun(runID string) error {
 	return s.manager.CancelRun(runID)
 }
 
-// CancelGroup cancels every run in a parallel group. Per-worker cancel
-// failures are individually reported (toast) AND folded into the joined error
-// returned to the binding — same cascading-failure pattern as StartParallelRuns.
+// CancelGroup cancels every run in a parallel group. Per-worker cancel failures
+// are individually reported and joined into the returned error.
 func (s *RunnerService) CancelGroup(groupID string) error {
 	s.groupsMu.Lock()
 	g, ok := s.groups[groupID]
@@ -255,10 +226,7 @@ func (s *RunnerService) CancelGroup(groupID string) error {
 		if err == nil {
 			continue
 		}
-		// Sibling already terminal (organic failure or completion before
-		// cancel-all arrived). Not a cancel failure — there is nothing to
-		// cancel. Filter out so we don't fire a spurious "did not cancel"
-		// toast for a worker the user already saw fail (or complete).
+		// Sibling already terminal — nothing to cancel, not a failure.
 		if errors.Is(err, runner.ErrRunNotActive) {
 			continue
 		}
@@ -278,8 +246,6 @@ func (s *RunnerService) CancelGroup(groupID string) error {
 	return errors.Join(errs...)
 }
 
-// registerGroup records a successfully-spawned parallel batch. Caller must
-// hold no lock; this method takes groupsMu internally.
 func (s *RunnerService) registerGroup(groupID, scriptID string, runIDs []string) {
 	g := &runGroup{
 		GroupID:  groupID,
@@ -294,9 +260,8 @@ func (s *RunnerService) registerGroup(groupID, scriptID string, runIDs []string)
 	}
 }
 
-// clearRunFromGroup removes a single runID from its group's reverse-lookup
-// map and deletes the group entry once every member has reached a terminal
-// state. Called from forwardMessages on terminal run:status.
+// clearRunFromGroup drops runID from its group; deletes the group once every
+// member has terminated.
 func (s *RunnerService) clearRunFromGroup(runID string) {
 	s.groupsMu.Lock()
 	defer s.groupsMu.Unlock()
@@ -306,7 +271,6 @@ func (s *RunnerService) clearRunFromGroup(runID string) {
 	}
 	delete(s.runGroups, runID)
 
-	// Once no live runID still maps to this group, delete the group entry.
 	for _, gid := range s.runGroups {
 		if gid == groupID {
 			return
@@ -315,28 +279,21 @@ func (s *RunnerService) clearRunFromGroup(runID string) {
 	delete(s.groups, groupID)
 }
 
-func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-chan runner.Message) {
-	// Track the most recent ErrorMsg payload so the StatusFailed toast can
-	// surface the real error text (and traceback) instead of just restating
-	// the script ID. Python's runner.fail() always sends ErrorMsg before
-	// StatusMsg(failed) on the same stream, so by the time the StatusMsg
-	// case runs, lastErrMessage is populated. forwardMessages runs once per
-	// run, so function-local state suffices — no shared map.
-	// emit calls Wails Event.Emit if the app has been wired up. Reservoir
-	// reports happen unconditionally (orthodoxy: every event flows through
-	// one ingress), so a not-yet-ready or shut-down app never causes log
-	// loss — only frontend live-update loss, which the banner system
-	// already surfaces.
-	emit := func(event string, payload any) {
-		if app := s.app.Load(); app != nil {
-			app.Event.Emit(event, payload)
-		}
+func (s *RunnerService) emit(event string, payload any) {
+	if app := s.app.Load(); app != nil {
+		app.Event.Emit(event, payload)
 	}
+}
+
+func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-chan runner.Message) {
+	// Python's runner.fail() always sends ErrorMsg before StatusMsg(failed) on
+	// the same stream, so the StatusFailed branch can surface the real error
+	// text by reading the captured lastErrMessage/Traceback below.
 	var lastErrMessage, lastErrTraceback string
 	for msg := range ch {
 		switch m := msg.(type) {
 		case runner.OutputMsg:
-			emit("run:output", map[string]string{
+			s.emit("run:output", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -351,7 +308,7 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				ScriptID:    scriptID,
 			})
 		case runner.ProgressMsg:
-			emit("run:progress", map[string]any{
+			s.emit("run:progress", map[string]any{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -360,20 +317,14 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				"label":    m.Label,
 			})
 		case runner.StatusMsg:
-			emit("run:status", map[string]string{
+			s.emit("run:status", map[string]string{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
 				"state":    string(m.State),
 			})
-			// Mid-run terminal toast: a collapsed task card no longer fails
-			// silently. Manager is the authoritative source of terminal state
-			// (see manager.waitForExit), but we only learn the scriptID here,
-			// so the toast originates at this layer.
-			//
-			// StatusCancelled never enters this branch — cancel is not a
-			// failure surface. Frontend reflects the new state via the
-			// run:status event above and renders a cancelled badge.
+			// Toast originates here (not Manager) because scriptID lives at
+			// this layer. Cancel is not a failure surface and skips the toast.
 			if m.State == runner.StatusFailed {
 				body := lastErrMessage
 				if body == "" {
@@ -394,15 +345,9 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				s.clearRunFromGroup(runID)
 			}
 		case runner.ErrorMsg:
-			// In-flight error from Python. Default routing: per-run pane
-			// (run:error) + slog. For runs the user explicitly cancelled,
-			// Python's cooperative-cancel path emits fail("Cancelled by
-			// user") which arrives here as an ErrorMsg — demote to log-only
-			// (Info+OneShot per the routing matrix) so the cancel doesn't
-			// surface as an error pane, but slog still records it. Sibling
-			// runs are untouched: WasCancelled is per-runID, so a worker
-			// erroring organically while another is cancelled still routes
-			// through PersistenceInFlight as before.
+			// Cancelled runs surface fail("Cancelled by user") as an ErrorMsg;
+			// demote to log-only so cancel doesn't open an error pane.
+			// WasCancelled is per-runID, so sibling errors still route normally.
 			sev := severityFromProto(m.Severity)
 			persist := notify.PersistenceInFlight
 			if s.manager.WasCancelled(runID) {
@@ -418,15 +363,10 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 				ScriptID:    scriptID,
 				Traceback:   m.Traceback,
 			})
-			// Capture for the StatusFailed toast (D1). Done unconditionally
-			// — even demoted errors set the body so a cancel/error race
-			// still produces a meaningful failure toast if the run later
-			// terminates as failed (which can't happen for a cancelled run,
-			// but the capture is harmless either way).
 			lastErrMessage = m.Message
 			lastErrTraceback = m.Traceback
 		case runner.DataMsg:
-			emit("run:data", map[string]any{
+			s.emit("run:data", map[string]any{
 				"runID":    runID,
 				"scriptID": scriptID,
 				"groupID":  groupID,
@@ -445,9 +385,8 @@ func (s *RunnerService) forwardMessages(runID, scriptID, groupID string, ch <-ch
 	}
 }
 
-// severityFromProto maps the proto Severity enum value carried on ErrorMsg
-// to the notify.Severity type. Unspecified defaults to Error for back-compat
-// with scripts that predate the severity field.
+// severityFromProto maps the proto Severity enum carried on ErrorMsg.
+// UNSPECIFIED (0) defaults to Error.
 func severityFromProto(p int32) notify.Severity {
 	switch p {
 	case 1: // SEVERITY_INFO
@@ -456,7 +395,7 @@ func severityFromProto(p int32) notify.Severity {
 		return notify.SeverityWarn
 	case 4: // SEVERITY_CRITICAL
 		return notify.SeverityCritical
-	default: // 0 (UNSPECIFIED) and 3 (ERROR)
+	default:
 		return notify.SeverityError
 	}
 }

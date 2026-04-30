@@ -63,30 +63,32 @@ func TestDeriveFinalStatus_CancelOverridesEverything(t *testing.T) {
 			},
 		},
 		{
-			name: "cancel overrides gotFailedStatus",
+			name: "cancel overrides pythonStatus=failed",
 			setupFlags: func(srv *GRPCServer, runID string) {
 				if rc, ok := srv.runs[runID]; ok {
-					rc.gotFailedStatus.Store(true)
+					s := StatusFailed
+					rc.pythonStatus.Store(&s)
 				}
 			},
 		},
 		{
-			name: "cancel overrides gotCompletedStatus",
+			name: "cancel overrides pythonStatus=completed",
 			setupFlags: func(srv *GRPCServer, runID string) {
 				if rc, ok := srv.runs[runID]; ok {
-					rc.gotCompletedStatus.Store(true)
+					s := StatusCompleted
+					rc.pythonStatus.Store(&s)
 				}
 			},
 		},
 		{
-			name:    "cancel overrides every flag at once",
+			name:     "cancel overrides every flag at once",
 			exitCode: 1,
-			waitErr: errors.New("boom"),
+			waitErr:  errors.New("boom"),
 			setupFlags: func(srv *GRPCServer, runID string) {
 				if rc, ok := srv.runs[runID]; ok {
 					rc.gotError.Store(true)
-					rc.gotFailedStatus.Store(true)
-					rc.gotCompletedStatus.Store(true)
+					s := StatusFailed
+					rc.pythonStatus.Store(&s)
 				}
 			},
 		},
@@ -143,16 +145,18 @@ func TestDeriveFinalStatus_NonCancelPathsUnchanged(t *testing.T) {
 			want: StatusFailed,
 		},
 		{
-			name: "rule 3: gotFailedStatus only",
+			name: "rule 3: pythonStatus=failed only",
 			setupFlags: func(srv *GRPCServer, runID string) {
-				srv.runs[runID].gotFailedStatus.Store(true)
+				s := StatusFailed
+				srv.runs[runID].pythonStatus.Store(&s)
 			},
 			want: StatusFailed,
 		},
 		{
-			name: "rule 4: gotCompletedStatus",
+			name: "rule 4: pythonStatus=completed",
 			setupFlags: func(srv *GRPCServer, runID string) {
-				srv.runs[runID].gotCompletedStatus.Store(true)
+				s := StatusCompleted
+				srv.runs[runID].pythonStatus.Store(&s)
 			},
 			want: StatusCompleted,
 		},

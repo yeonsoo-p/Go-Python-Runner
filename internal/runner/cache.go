@@ -4,30 +4,27 @@ import (
 	"sync"
 )
 
-// CacheBlock represents a shared memory block tracked by the cache manager.
 type CacheBlock struct {
 	Key      string
 	ShmName  string
 	Size     int64
-	OwnerRun string   // runID that created it
-	Refs     []string // runIDs currently referencing it
+	OwnerRun string
+	Refs     []string
 }
 
-// CacheManager tracks shared memory blocks used by Python scripts.
-// Go manages the registry and lifecycle; Python scripts access the data directly.
+// CacheManager tracks shared-memory blocks used by Python scripts. Go owns
+// the registry and lifecycle; Python opens the blocks directly.
 type CacheManager struct {
 	mu     sync.RWMutex
 	blocks map[string]*CacheBlock
 }
 
-// NewCacheManager creates a new cache manager.
 func NewCacheManager() *CacheManager {
 	return &CacheManager{
 		blocks: make(map[string]*CacheBlock),
 	}
 }
 
-// Register adds or updates a cache block in the registry.
 func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -40,7 +37,6 @@ func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID str
 	}
 }
 
-// LookupAndRef atomically looks up a cache block and adds a reference.
 func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size int64, found bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -57,12 +53,10 @@ func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size in
 	return block.ShmName, block.Size, true
 }
 
-// Release removes a run ID reference from a cache block.
-// If no references remain, the block is removed from the registry and the
-// underlying OS shared-memory name is unlinked (on Linux/macOS — see
-// shm_unix.go). On Windows the OS handles reclamation when the last handle
-// closes, so unlinkShm is a no-op there.
-// Returns true if the runID was actually referencing the block, false otherwise.
+// Release drops runID from the block's refs. When refs hit zero the block
+// is removed from the registry and unlinkShm runs (no-op on Windows; the OS
+// reclaims pagefile-backed shm when the last handle closes). Returns true
+// if runID was actually referencing the block.
 func (cm *CacheManager) Release(key, runID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -85,22 +79,10 @@ func (cm *CacheManager) Release(key, runID string) bool {
 	return found
 }
 
-// CleanupRun removes a terminated run's references from all cache blocks.
-// Blocks with zero remaining references are deleted from the registry and
-// their underlying OS shared-memory names are unlinked (on Linux/macOS).
-//
-// CANONICAL cache-lifecycle authority. Manager.waitForExit calls this for
-// EVERY terminal status — graceful exit, crash, SIGKILL, cancel — so blocks
-// always get cleaned up regardless of how Python died. Mirrors Python's
-// best-effort atexit `_cleanup_cache` in runner.py, which only fires on
-// graceful shutdown; this method covers the cases atexit can't.
-//
-// Both paths are idempotent — finding zero refs to drop is a no-op.
-//
-// This plugs the leak when an owning Python process crashes via os._exit()
-// or SIGKILL — its atexit handler doesn't run, but Go cleans up here.
-// On Windows, the OS reclaims pagefile-backed shm when the last handle
-// closes, so the unlinkShm call is a no-op.
+// CleanupRun is the authoritative cache-lifecycle hook. Manager.waitForExit
+// calls it for every terminal status — graceful exit, crash, SIGKILL, cancel
+// — so blocks are reclaimed even when Python's atexit handler couldn't run
+// (os._exit / SIGKILL). Idempotent.
 func (cm *CacheManager) CleanupRun(runID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()

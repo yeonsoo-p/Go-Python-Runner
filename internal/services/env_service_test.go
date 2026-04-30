@@ -357,14 +357,14 @@ func TestEnvService_ListPackages_FailureReports(t *testing.T) {
 }
 
 // TestEnvService_ConcurrentInstallsRejected — second install must be
-// rejected (mutex is TryLock, returns busy error rather than blocking).
+// rejected (CAS fails, returns busy error rather than blocking).
 func TestEnvService_ConcurrentInstallsRejected(t *testing.T) {
 	fakePython := buildFakePython(t)
 	svc, _, rec := makeEnvService(t, fakePython, true)
 
-	// Manually hold the mutex so the second call sees TryLock fail.
-	svc.mu.Lock()
-	defer svc.mu.Unlock()
+	// Manually flip op to running so the second call sees CAS fail.
+	svc.op.Store(envOpRunning)
+	defer svc.op.Store(envOpIdle)
 
 	err := svc.InstallPackage("pandas", "")
 	if err == nil {
