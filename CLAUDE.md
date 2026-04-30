@@ -617,7 +617,7 @@ Authoritative implementation: `Manager.StartRun` / `Manager.waitForExit` in `int
 | Safeguard | Detail |
 | --- | --- |
 | **Typed `RunStatus`** | Go: `RunStatus` string type with `StatusRunning`/`StatusCompleted`/`StatusFailed` constants (`manager.go`). TypeScript: `RunStatus` union type (`useScripts.ts`). Python: `STATUS_COMPLETED`/`STATUS_FAILED` constants (`runner.py`). Proto wire format remains `string` — typed boundary at gRPC handler via `RunStatus(m.Status.State)`. |
-| **Transition guards** | Go Manager: `IsTerminal()` prevents overwriting a terminal status (`manager.go`). Frontend: `onStatus` and `onError` handlers skip updates when status is already `"completed"` or `"failed"` (`useScripts.ts`). |
+| **Transition guards** | Go Manager: `IsTerminal()` prevents overwriting a terminal status (`manager.go`). Frontend has no guard by design — Manager is the sole emitter of `run:status` and emits exactly once at the terminal state, so `useScripts.ts onStatus` writes unconditionally. `onError` updates `run.error` only and never touches `run.status`. Adding a frontend `IsTerminal()` check would put state-machine logic in two places, contradicting "Frontend shows, Go manages." Manager's exactly-once contract is pinned by `tests/integration/trust_order_test.go`. |
 | **Atomic `gotError`** | `RunChannel.gotError` uses `atomic.Bool` for lock-free, race-free access across goroutines (`grpc_server.go`). |
 
 ### Remaining Architectural Notes
@@ -625,7 +625,7 @@ Authoritative implementation: `Manager.StartRun` / `Manager.waitForExit` in `int
 | Item | Detail |
 | --- | --- |
 | **Hidden sub-states** | `RunChannel` has its own state machine (`stream=nil` → `stream=set` → `closed=true`) invisible to the `Status` field. A run can be `StatusRunning` while Python hasn't connected or the gRPC stream is dead. This is by design — these are internal to gRPC plumbing and guarded by `closedMu`/`connectOnce`. |
-| **Multiple status sources** | Go Manager (process exit), Python (gRPC `StatusMsg`), and React (error events) can all set status. Transition guards prevent terminal→non-terminal overwrites, but the Go Manager is the authoritative final-status source via `waitForExit`. |
+| **Multiple status sources** | Go Manager (process exit) and Python (gRPC `StatusMsg`) both feed into `Manager.deriveFinalStatus`; React never sets status. The gRPC handler folds Python's `Status` into `gotCompletedStatus`/`gotFailedStatus` atomic flags but does not emit `run:status` itself — Manager's `waitForExit` is the authoritative single emitter. |
 | **Implicit cleanup ordering** | Cache cleanup → gRPC unregister → map removal → history append must happen in sequence (`manager.go`). Ordering is enforced by code sequencing in the `waitForExit` goroutine. |
 
 ### Future Work

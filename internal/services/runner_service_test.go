@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"testing"
 
 	"go-python-runner/internal/db"
@@ -19,17 +20,12 @@ func TestRunnerService_StartRun_ScriptNotFound(t *testing.T) {
 		t.Error("expected error for nonexistent script")
 	}
 
-	// Four-part contract: error returned (above) + reservoir reported.
-	events := rec.FindBySeverity(notify.SeverityError)
-	if len(events) != 1 {
-		t.Fatalf("want 1 reservoir error event, got %d", len(events))
-	}
-	if events[0].Persistence != notify.PersistenceOneShot {
-		t.Errorf("want OneShot persistence, got %v", events[0].Persistence)
-	}
-	if events[0].ScriptID != "nonexistent" {
-		t.Errorf("want scriptID=nonexistent, got %q", events[0].ScriptID)
-	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:    notify.SeverityError,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+		ScriptID:    "nonexistent",
+	})
 }
 
 func testDB(t *testing.T) *db.DB {
@@ -44,6 +40,10 @@ func testDB(t *testing.T) *db.DB {
 	return store
 }
 
+// TestRunnerService_CancelRun_NotFound pins the orthodox cancellation
+// pattern: cancelling a non-active run returns the runner.ErrRunNotActive
+// sentinel and does NOT call reservoir.Report — cancellation is not a
+// failure (CLAUDE.md § Cancellation vs failure).
 func TestRunnerService_CancelRun_NotFound(t *testing.T) {
 	cache := runner.NewCacheManager()
 	rec := &notify.RecordingReservoir{}
@@ -59,7 +59,13 @@ func TestRunnerService_CancelRun_NotFound(t *testing.T) {
 
 	err = svc.CancelRun("nonexistent-run-id")
 	if err == nil {
-		t.Error("expected error for cancelling nonexistent run")
+		t.Fatal("expected error for cancelling nonexistent run")
+	}
+	if !errors.Is(err, runner.ErrRunNotActive) {
+		t.Errorf("want ErrRunNotActive sentinel, got %v", err)
+	}
+	if got := rec.FindBySeverity(notify.SeverityError); len(got) != 0 {
+		t.Errorf("cancellation of non-active run must not Report errors, got %d", len(got))
 	}
 }
 

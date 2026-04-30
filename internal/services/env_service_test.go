@@ -77,10 +77,12 @@ func main() {
 
 // makeEnvService constructs an EnvService directly (bypassing FindVenv) so
 // tests can point it at the fake-python binary without a real venv on disk.
-// Returns the service plus a captured-events sink for emit().
-func makeEnvService(t *testing.T, fakePython string, editable bool) (*EnvService, *eventSink) {
+// Returns the service, a captured-events sink for emit(), and the reservoir
+// so tests can assert the four-part error contract via notify.AssertContract.
+func makeEnvService(t *testing.T, fakePython string, editable bool) (*EnvService, *eventSink, *notify.RecordingReservoir) {
 	t.Helper()
 	sink := &eventSink{}
+	rec := &notify.RecordingReservoir{}
 	svc := &EnvService{
 		info: EnvInfo{
 			PythonPath: fakePython,
@@ -88,12 +90,12 @@ func makeEnvService(t *testing.T, fakePython string, editable bool) (*EnvService
 			ToolName:   "pip",
 			Editable:   editable,
 		},
-		reservoir: &notify.RecordingReservoir{},
+		reservoir: rec,
 	}
 	// Substitute a custom command hook for the rare test that needs it; by
 	// default just exec the fakePython binary directly.
 	_ = sink.attach(svc)
-	return svc, sink
+	return svc, sink, rec
 }
 
 // eventSink replaces emit() with a captured map so tests can assert event
@@ -136,7 +138,7 @@ func (s *eventSink) captureEmit(fn func()) []sinkEvent {
 // is parsed into the typed []Package shape.
 func TestEnvService_ListPackages_ParsesJSON(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	pkgs, err := svc.ListPackages()
 	if err != nil {
@@ -154,7 +156,7 @@ func TestEnvService_ListPackages_ParsesJSON(t *testing.T) {
 // (fake) subprocess succeeds and busy state clears.
 func TestEnvService_InstallPackage_HappyPath(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	if svc.EnvBusy() {
 		t.Errorf("svc should not be busy at start")
@@ -171,19 +173,25 @@ func TestEnvService_InstallPackage_HappyPath(t *testing.T) {
 // invalid input returns error, doesn't touch state.
 func TestEnvService_InstallPackage_RejectsEmptySpec(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, rec := makeEnvService(t, fakePython, true)
 
 	err := svc.InstallPackage("", "")
 	if err == nil {
 		t.Fatal("expected error for empty spec")
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "spec cannot be empty",
+	})
 }
 
 // TestEnvService_InstallPackage_RejectsReadOnlyVenv — when Editable=false,
 // install must fail with a clear error before invoking pip.
 func TestEnvService_InstallPackage_RejectsReadOnlyVenv(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, false)
+	svc, _, rec := makeEnvService(t, fakePython, false)
 
 	err := svc.InstallPackage("pandas", "")
 	if err == nil {
@@ -192,49 +200,73 @@ func TestEnvService_InstallPackage_RejectsReadOnlyVenv(t *testing.T) {
 	if !strings.Contains(err.Error(), "not writable") {
 		t.Errorf("expected 'not writable' in error, got %q", err.Error())
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "not writable",
+	})
 }
 
 // TestEnvService_InstallPackage_NonZeroExitSurfacesError — pip returns
 // non-zero, the error must propagate (not silently succeed).
 func TestEnvService_InstallPackage_NonZeroExitSurfacesError(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, rec := makeEnvService(t, fakePython, true)
 
 	err := svc.InstallPackage("--fail", "")
 	if err == nil {
 		t.Fatal("expected error when pip exits non-zero")
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "install --fail",
+	})
 }
 
 // TestEnvService_InstallRequirements_MissingFile — missing requirements.txt
 // must fail before invoking pip (clean error path).
 func TestEnvService_InstallRequirements_MissingFile(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, rec := makeEnvService(t, fakePython, true)
 
 	err := svc.InstallRequirements(filepath.Join(t.TempDir(), "no-such-file.txt"), "")
 	if err == nil {
 		t.Fatal("expected error for missing requirements file")
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "no-such-file.txt",
+	})
 }
 
 // TestEnvService_InstallRequirements_RejectsDirectory — pointing at a
 // directory is invalid input.
 func TestEnvService_InstallRequirements_RejectsDirectory(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, rec := makeEnvService(t, fakePython, true)
 
 	err := svc.InstallRequirements(t.TempDir(), "")
 	if err == nil {
 		t.Fatal("expected error when requirements path is a directory")
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "is a directory",
+	})
 }
 
 // TestEnvService_InstallRequirements_HappyPath — valid file, install
 // succeeds.
 func TestEnvService_InstallRequirements_HappyPath(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	reqFile := filepath.Join(t.TempDir(), "requirements.txt")
 	if err := os.WriteFile(reqFile, []byte("pandas\nrequests\n"), 0o644); err != nil {
@@ -249,18 +281,86 @@ func TestEnvService_InstallRequirements_HappyPath(t *testing.T) {
 // TestEnvService_UninstallPackage_HappyPath — uninstall succeeds.
 func TestEnvService_UninstallPackage_HappyPath(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	if err := svc.UninstallPackage("pandas"); err != nil {
 		t.Fatalf("UninstallPackage: %v", err)
 	}
 }
 
+// TestEnvService_UninstallPackage_RejectsEmptyName — invalid input must
+// fail before invoking pip and surface through the reservoir.
+func TestEnvService_UninstallPackage_RejectsEmptyName(t *testing.T) {
+	fakePython := buildFakePython(t)
+	svc, _, rec := makeEnvService(t, fakePython, true)
+
+	err := svc.UninstallPackage("")
+	if err == nil {
+		t.Fatal("expected error for empty package name")
+	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "name cannot be empty",
+	})
+}
+
+// TestEnvService_UninstallPackage_RejectsReadOnlyVenv — read-only venv
+// blocks uninstall the same way it blocks install.
+func TestEnvService_UninstallPackage_RejectsReadOnlyVenv(t *testing.T) {
+	fakePython := buildFakePython(t)
+	svc, _, rec := makeEnvService(t, fakePython, false)
+
+	err := svc.UninstallPackage("pandas")
+	if err == nil {
+		t.Fatal("expected error when venv is not writable")
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Errorf("expected 'not writable' in error, got %q", err.Error())
+	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "not writable",
+	})
+}
+
+// TestEnvService_ListPackages_FailureReports — when the underlying python
+// invocation fails, the error must propagate AND be recorded via the
+// reservoir (the failure path inside ListPackages was previously untested).
+func TestEnvService_ListPackages_FailureReports(t *testing.T) {
+	rec := &notify.RecordingReservoir{}
+	svc := &EnvService{
+		info: EnvInfo{
+			PythonPath: filepath.Join(t.TempDir(), "no-such-python"),
+			VenvPath:   t.TempDir(),
+			ToolName:   "pip",
+			Editable:   true,
+		},
+		reservoir: rec,
+	}
+
+	pkgs, err := svc.ListPackages()
+	if err == nil {
+		t.Fatal("expected error when python binary is missing")
+	}
+	if pkgs != nil {
+		t.Errorf("expected nil pkgs on error, got %v", pkgs)
+	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:    notify.SeverityError,
+		Persistence: notify.PersistenceOneShot,
+		Source:      notify.SourceBackend,
+	})
+}
+
 // TestEnvService_ConcurrentInstallsRejected — second install must be
 // rejected (mutex is TryLock, returns busy error rather than blocking).
 func TestEnvService_ConcurrentInstallsRejected(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, rec := makeEnvService(t, fakePython, true)
 
 	// Manually hold the mutex so the second call sees TryLock fail.
 	svc.mu.Lock()
@@ -273,13 +373,19 @@ func TestEnvService_ConcurrentInstallsRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "already in flight") {
 		t.Errorf("expected 'already in flight' in error, got %q", err.Error())
 	}
+	notify.AssertContract(t, rec, notify.ContractExpectation{
+		Severity:        notify.SeverityError,
+		Persistence:     notify.PersistenceOneShot,
+		Source:          notify.SourceBackend,
+		MessageContains: "already in flight",
+	})
 }
 
 // TestEnvService_IndexURLPassedThrough — when indexURL is non-empty, the
 // --index-url flag must reach the underlying command.
 func TestEnvService_IndexURLPassedThrough(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	// Hook into command construction to capture argv.
 	var captured []string
@@ -313,7 +419,7 @@ func TestEnvService_IndexURLPassedThrough(t *testing.T) {
 // inspector path.
 func TestEnvService_GetEnvInfo_ReturnsConfiguredInfo(t *testing.T) {
 	fakePython := buildFakePython(t)
-	svc, _ := makeEnvService(t, fakePython, true)
+	svc, _, _ := makeEnvService(t, fakePython, true)
 
 	info := svc.GetEnvInfo()
 	if info.PythonPath != fakePython {
