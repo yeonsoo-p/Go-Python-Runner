@@ -30,7 +30,9 @@ func blockRefs(cm *CacheManager, key string) []string {
 
 func TestCacheManager_RegisterAndLookup(t *testing.T) {
 	cm := NewCacheManager()
-	cm.Register("features", "shm_001", 1024, "run-1")
+	if !cm.Register("features", "shm_001", 1024, "run-1") {
+		t.Fatal("expected first Register to succeed")
+	}
 
 	name, size, found := cm.LookupAndRef("features", "run-1")
 	if !found {
@@ -71,6 +73,31 @@ func TestCacheManager_RefCounting(t *testing.T) {
 	cm.Release("data", "run-3")
 	if hasBlock(cm, "data") {
 		t.Error("block should be removed after all refs released")
+	}
+}
+
+// Register must reject a second call for the same key — overwriting would
+// orphan the prior block (its ShmName is lost from the map, so CleanupRun can
+// no longer unlink it) and silently drop every other run's ref.
+func TestCacheManager_RegisterRejectsDuplicateKey(t *testing.T) {
+	cm := NewCacheManager()
+	if !cm.Register("data", "shm_first", 100, "run-1") {
+		t.Fatal("expected first Register to succeed")
+	}
+	cm.LookupAndRef("data", "run-2") // run-2 grabs a ref
+
+	if cm.Register("data", "shm_second", 200, "run-3") {
+		t.Fatal("expected duplicate-key Register to be rejected")
+	}
+
+	// Original block must be intact: same shm_name, original owner, refs preserved.
+	name, size, found := cm.LookupAndRef("data", "run-1")
+	if !found || name != "shm_first" || size != 100 {
+		t.Errorf("expected original block intact, got name=%q size=%d found=%v", name, size, found)
+	}
+	refs := blockRefs(cm, "data")
+	if len(refs) != 2 {
+		t.Errorf("expected refs preserved (run-1, run-2), got %v", refs)
 	}
 }
 
@@ -131,25 +158,34 @@ func TestCacheManager_ConcurrentAccess(t *testing.T) {
 	const goroutines = 20
 	const ops = 100
 
+	// Pre-register a shared key that all goroutines will lookup/release against —
+	// this exercises concurrent ref-list mutation. Per-goroutine unique keys
+	// exercise concurrent map insertion/deletion. Concurrent Register on the
+	// SAME key now intentionally rejects (see TestCacheManager_RegisterRejectsDuplicateKey),
+	// so we don't loop Register on a shared key here.
+	if !cm.Register("shared", "shm-shared", 100, "owner") {
+		t.Fatal("setup: shared Register failed")
+	}
+
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			key := fmt.Sprintf("key-%d", id%5)
 			runID := fmt.Sprintf("run-%d", id)
 			for i := 0; i < ops; i++ {
-				cm.Register(key, fmt.Sprintf("shm-%d-%d", id, i), int64(i), runID)
-				cm.LookupAndRef(key, runID)
-				cm.Release(key, runID)
+				ownKey := fmt.Sprintf("key-%d-%d", id, i)
+				cm.Register(ownKey, fmt.Sprintf("shm-%d-%d", id, i), int64(i), runID)
+				cm.LookupAndRef("shared", runID)
+				cm.Release("shared", runID)
+				cm.Release(ownKey, runID)
 			}
 		}(g)
 	}
 	wg.Wait()
 
-	// Primary assertion: no panic. Also verify cleanup works after concurrent ops.
-	for i := 0; i < 5; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		cm.Release(key, "any") // best-effort cleanup of any leftover refs
+	// Primary assertion: no panic. Shared block survives (owner ref still held).
+	if !hasBlock(cm, "shared") {
+		t.Error("expected shared block to survive concurrent ops (owner still holds ref)")
 	}
 }

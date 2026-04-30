@@ -25,9 +25,18 @@ func NewCacheManager() *CacheManager {
 	}
 }
 
-func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID string) {
+// Register adds a new block to the registry. Returns false if the key is
+// already registered — overwriting would orphan the prior block (its
+// ShmName is lost from the map, so CleanupRun can no longer unlink it) and
+// silently drop every other run's ref. The caller (handleCacheCreate) is
+// expected to surface the rejection back to the producing script so it can
+// release its just-created shm and stop assuming the data is shared.
+func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID string) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	if _, exists := cm.blocks[key]; exists {
+		return false
+	}
 	cm.blocks[key] = &CacheBlock{
 		Key:      key,
 		ShmName:  shmName,
@@ -35,6 +44,7 @@ func (cm *CacheManager) Register(key, shmName string, size int64, ownerRunID str
 		OwnerRun: ownerRunID,
 		Refs:     []string{ownerRunID},
 	}
+	return true
 }
 
 func (cm *CacheManager) LookupAndRef(key, runID string) (shmName string, size int64, found bool) {

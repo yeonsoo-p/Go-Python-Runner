@@ -405,7 +405,9 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 			Value: m.Data.Value,
 		})
 	case *pb.ClientMessage_CacheCreate:
-		s.handleCacheCreate(runID, m.CacheCreate)
+		if err := s.handleCacheCreate(runID, ch, m.CacheCreate); err != nil {
+			return err
+		}
 	case *pb.ClientMessage_CacheLookup:
 		if err := s.handleCacheLookup(runID, ch, m.CacheLookup); err != nil {
 			return err
@@ -422,14 +424,45 @@ func (s *GRPCServer) handleClientMessage(runID string, ch *RunChannel, msg *pb.C
 	return nil
 }
 
-func (s *GRPCServer) handleCacheCreate(runID string, req *pb.CacheCreate) {
-	s.cache.Register(req.Key, req.ShmName, req.Size, runID)
+func (s *GRPCServer) handleCacheCreate(runID string, ch *RunChannel, req *pb.CacheCreate) error {
+	if s.cache.Register(req.Key, req.ShmName, req.Size, runID) {
+		s.reservoir.Report(notify.Event{
+			Severity:    notify.SeverityInfo,
+			Persistence: notify.PersistenceOneShot,
+			Source:      notify.SourceBackend,
+			Message:     fmt.Sprintf("cache block registered: key=%s shm=%s size=%d", req.Key, req.ShmName, req.Size),
+			RunID:       runID,
+		})
+		return ch.streamSend(&pb.ServerMessage{
+			Msg: &pb.ServerMessage_CacheInfo{
+				CacheInfo: &pb.CacheInfo{
+					Key:     req.Key,
+					ShmName: req.ShmName,
+					Size:    req.Size,
+					Found:   true,
+				},
+			},
+		})
+	}
+	rejection := fmt.Sprintf("cache key %q already registered", req.Key)
+	err := errors.New(rejection)
 	s.reservoir.Report(notify.Event{
-		Severity:    notify.SeverityInfo,
-		Persistence: notify.PersistenceOneShot,
+		Severity:    notify.SeverityError,
+		Persistence: notify.PersistenceInFlight,
 		Source:      notify.SourceBackend,
-		Message:     fmt.Sprintf("cache block registered: key=%s shm=%s size=%d", req.Key, req.ShmName, req.Size),
+		Title:       "cache_set rejected",
+		Message:     rejection,
+		Err:         err,
 		RunID:       runID,
+	})
+	return ch.streamSend(&pb.ServerMessage{
+		Msg: &pb.ServerMessage_CacheInfo{
+			CacheInfo: &pb.CacheInfo{
+				Key:   req.Key,
+				Found: true,
+				Error: rejection,
+			},
+		},
 	})
 }
 

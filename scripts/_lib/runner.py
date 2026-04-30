@@ -344,30 +344,50 @@ def cache_set(key: str, obj: object) -> None:
     this block to unlink it from ``/dev/shm`` on exit, killing the segment
     while the producer is still alive. ``_cleanup_cache`` and Go provide the
     backstop unlink for owned keys.
+
+    Synchronous: blocks on Go's CacheInfo ack. Go rejects when the key is
+    already registered (overwriting would orphan the prior block and silently
+    drop every other run's ref). On rejection we close+unlink our just-created
+    shm and raise — the script must learn that its data isn't actually shared.
     """
+    if _stream is None:
+        raise RuntimeError("not connected — call connect() first")
+
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
     shm = shared_memory.SharedMemory(create=True, size=len(data), track=False)
+    registered = False
     try:
         if shm.buf is None:
             raise RuntimeError("SharedMemory buffer is None")
         shm.buf[: len(data)] = data
 
-        _send(
-            runner_pb2.ClientMessage(
-                cache_create=runner_pb2.CacheCreate(
-                    key=str(key),
-                    size=len(data),
-                    shm_name=shm.name,
+        with _request_lock:
+            _send(
+                runner_pb2.ClientMessage(
+                    cache_create=runner_pb2.CacheCreate(
+                        key=str(key),
+                        size=len(data),
+                        shm_name=shm.name,
+                    )
                 )
             )
-        )
-    except Exception:
-        # Clean up the shared memory block if registration with Go failed
-        with contextlib.suppress(OSError):
-            shm.close()
-        with contextlib.suppress(OSError):
-            shm.unlink()
-        raise
+            try:
+                resp = _recv_response("cache create")
+            except grpc.RpcError as e:
+                raise RuntimeError(f"Lost connection while waiting for cache create ack: {e}") from e
+            if not resp.HasField("cache_info"):
+                raise RuntimeError(f"Expected CacheInfo response to cache_create, got {resp}")
+
+        info = resp.cache_info
+        if info.error:
+            raise RuntimeError(f"cache_set rejected: {info.error}")
+        registered = True
+    finally:
+        if not registered:
+            with contextlib.suppress(OSError):
+                shm.close()
+            with contextlib.suppress(OSError):
+                shm.unlink()
 
     _cache_refs[key] = shm
     _cache_owned.add(key)

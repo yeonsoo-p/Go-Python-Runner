@@ -101,6 +101,7 @@ message CacheInfo {
   string shm_name = 2;
   int64 size = 3;
   bool found = 4;
+  string error = 5;
 }
 
 message CacheRelease {

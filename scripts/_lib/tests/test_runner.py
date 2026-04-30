@@ -24,10 +24,28 @@ def setup_function() -> None:
     runner._stream = None
     runner._stub = None
     runner._cache_refs = {}
+    runner._cache_owned = set()
     runner._cancel_event = runner.threading.Event()
     runner._finished = False
     runner._reader_thread = None
     runner._reader_started = False
+    runner._reader_error = None
+    runner._response_queue = runner.queue.Queue()
+
+
+def _prime_cache_create_response(*, error: str = "") -> None:
+    """Set up runner module so cache_set's _recv_response returns a CacheInfo.
+
+    Tests don't have a real gRPC stream, so we mark _stream as truthy and
+    stub _start_reader_thread by flipping _reader_started to True. The fake
+    response is preloaded onto _response_queue.
+    """
+    from gen import runner_pb2 as pb
+
+    runner._stream = object()  # truthy; _recv_response only checks for None
+    runner._reader_started = True  # short-circuit _start_reader_thread
+    info = pb.CacheInfo(found=True, error=error)
+    runner._response_queue.put(pb.ServerMessage(cache_info=info))
 
 
 def _drain_messages(msg_iter: runner._MessageIterator, count: int) -> list[Any]:
@@ -103,6 +121,7 @@ def test_multiple_outputs() -> None:
 
 
 def test_cache_set_sends_cache_create_message() -> None:
+    _prime_cache_create_response()
     runner.cache_set("test_key", {"hello": "world"})
     msgs = _drain_messages(runner._msg_iter, 1)
     assert len(msgs) == 1
@@ -116,6 +135,24 @@ def test_cache_set_sends_cache_create_message() -> None:
     runner._cache_refs["test_key"].close()
     runner._cache_refs["test_key"].unlink()
     del runner._cache_refs["test_key"]
+
+
+def test_cache_set_raises_on_rejection() -> None:
+    """When Go rejects a duplicate key, cache_set must release its just-created
+    shm and raise — the script can't be allowed to keep working with the
+    assumption that its data was shared."""
+    _prime_cache_create_response(error='cache key "dup" already registered')
+    with pytest.raises(RuntimeError, match="cache_set rejected"):
+        runner.cache_set("dup", {"payload": 1})
+    # Ref must NOT be stored — registration failed.
+    assert "dup" not in runner._cache_refs
+    assert "dup" not in runner._cache_owned
+
+
+def test_cache_set_raises_without_connection() -> None:
+    """cache_set must raise RuntimeError if connect() was never called."""
+    with pytest.raises(RuntimeError, match="not connected"):
+        runner.cache_set("k", {"x": 1})
 
 
 def test_cache_release_sends_message() -> None:

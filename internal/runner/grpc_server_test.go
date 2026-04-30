@@ -219,6 +219,20 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// First response is the CacheCreate ack (Go acks every cache_create so
+	// Python's cache_set can detect duplicate-key rejections synchronously).
+	createAck, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := createAck.GetCacheInfo()
+	if ack == nil {
+		t.Fatal("expected CacheInfo ack for cache_create")
+	}
+	if !ack.Found || ack.Error != "" || ack.ShmName != "shm_test_001" || ack.Size != 4096 {
+		t.Errorf("unexpected cache_create ack: %+v", ack)
+	}
+
 	// Lookup via gRPC — the cache_create is processed server-side before
 	// this lookup arrives (same stream, ordered delivery)
 	err = stream.Send(&pb.ClientMessage{
@@ -230,7 +244,7 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Receive CacheInfo response
+	// Second response is the lookup result.
 	resp, err := stream.Recv()
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +255,69 @@ func TestGRPCServer_CacheCreateAndLookup(t *testing.T) {
 	}
 	if !info.Found || info.ShmName != "shm_test_001" || info.Size != 4096 {
 		t.Errorf("unexpected cache info: %+v", info)
+	}
+}
+
+// TestGRPCServer_CacheCreateRejectsDuplicate verifies the server rejects a
+// cache_create for an already-registered key by acking with a non-empty
+// CacheInfo.error, instead of silently overwriting the prior block.
+func TestGRPCServer_CacheCreateRejectsDuplicate(t *testing.T) {
+	srv, cleanup := testGRPCServer(t)
+	defer cleanup()
+
+	srv.RegisterRun("run-dup")
+	stream, connCleanup := connectClient(t, srv.Addr(), "run-dup")
+	defer connCleanup()
+
+	<-srv.WaitConnected("run-dup")
+
+	// First registration succeeds.
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_CacheCreate{
+			CacheCreate: &pb.CacheCreate{Key: "k", Size: 100, ShmName: "shm_first"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack := first.GetCacheInfo(); ack == nil || ack.Error != "" {
+		t.Fatalf("expected first cache_create to be acked clean, got %+v", ack)
+	}
+
+	// Second registration with the same key must be rejected.
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_CacheCreate{
+			CacheCreate: &pb.CacheCreate{Key: "k", Size: 200, ShmName: "shm_second"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rej := second.GetCacheInfo()
+	if rej == nil || rej.Error == "" {
+		t.Fatalf("expected duplicate cache_create to be rejected, got %+v", rej)
+	}
+
+	// Original block must still resolve to the FIRST shm — the rejection
+	// must not have overwritten it.
+	if err := stream.Send(&pb.ClientMessage{
+		Msg: &pb.ClientMessage_CacheLookup{CacheLookup: &pb.CacheLookup{Key: "k"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := lookup.GetCacheInfo()
+	if info == nil || info.ShmName != "shm_first" || info.Size != 100 {
+		t.Errorf("expected lookup to resolve to original block, got %+v", info)
 	}
 }
 
