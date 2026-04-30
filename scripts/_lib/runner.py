@@ -264,11 +264,7 @@ def warn(message: str) -> None:
     recoverable issues the user/operator should know about but that don't
     invalidate the run's results (e.g. "row 7 had a malformed value, skipped").
     """
-    _send(
-        runner_pb2.ClientMessage(
-            error=runner_pb2.Error(message=str(message), severity=SEVERITY_WARN)
-        )
-    )
+    _send(runner_pb2.ClientMessage(error=runner_pb2.Error(message=str(message), severity=SEVERITY_WARN)))
 
 
 def info(message: str) -> None:
@@ -279,11 +275,7 @@ def info(message: str) -> None:
     LogViewer / log file (e.g. "loaded 12 rows from cache"). Use ``output()``
     for results, ``info()`` for trace.
     """
-    _send(
-        runner_pb2.ClientMessage(
-            error=runner_pb2.Error(message=str(message), severity=SEVERITY_INFO)
-        )
-    )
+    _send(runner_pb2.ClientMessage(error=runner_pb2.Error(message=str(message), severity=SEVERITY_INFO)))
 
 
 def _finish() -> None:

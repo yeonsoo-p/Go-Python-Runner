@@ -171,12 +171,69 @@ func main() {
 	if envSvc != nil {
 		wailsServices = append(wailsServices, application.NewService(envSvc))
 	}
+	// mainWindow is captured by the SingleInstance callback below and assigned
+	// after app.Window.NewWithOptions creates the actual window. The callback
+	// fires on the first (already-running) instance when a second is launched.
+	var mainWindow *application.WebviewWindow
 	app := application.New(application.Options{
 		Name:        "Go Python Runner",
 		Description: "Orchestrates bundled Python scripts through a Go backend",
 		Services:    wailsServices,
+		// Wails routes its own info/debug traces through this logger so they
+		// land in the same app.log + ring buffer + LogViewer as ours.
+		// ErrorHandler/WarningHandler below additionally forward Wails-internal
+		// errors and warnings through the reservoir so they reach the toast
+		// surface, not just the log.
+		Logger: logger,
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
+		},
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "com.go-python-runner.app",
+			OnSecondInstanceLaunch: func(data application.SecondInstanceData) {
+				reservoir.Report(notify.Event{
+					Severity:    notify.SeverityInfo,
+					Persistence: notify.PersistenceOneShot,
+					Source:      notify.SourceBackend,
+					Message: fmt.Sprintf("second instance launched, focusing existing window: args=%v cwd=%s",
+						data.Args, data.WorkingDir),
+				})
+				if mainWindow != nil {
+					mainWindow.Restore()
+					mainWindow.Focus()
+				}
+			},
+		},
+		ErrorHandler: func(err error) {
+			reservoir.Report(notify.Event{
+				Severity:    notify.SeverityError,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Wails internal error",
+				Message:     err.Error(),
+				Err:         err,
+			})
+		},
+		WarningHandler: func(msg string) {
+			reservoir.Report(notify.Event{
+				Severity:    notify.SeverityWarn,
+				Persistence: notify.PersistenceOneShot,
+				Source:      notify.SourceBackend,
+				Title:       "Wails internal warning",
+				Message:     msg,
+			})
+		},
+		PanicHandler: func(p *application.PanicDetails) {
+			reservoir.Report(notify.Event{
+				Severity:    notify.SeverityCritical,
+				Persistence: notify.PersistenceCatastrophic,
+				Source:      notify.SourceBackend,
+				Title:       "Wails panic",
+				Message:     p.Error.Error(),
+				Err:         p.Error,
+				Traceback:   p.FullStackTrace,
+			})
+			os.Exit(1)
 		},
 	})
 
@@ -211,8 +268,9 @@ func main() {
 		}
 	}()
 
-	// Create main window
-	app.Window.NewWithOptions(application.WebviewWindowOptions{
+	// Create main window. Assigning to mainWindow lets the SingleInstance
+	// callback above focus this window when a second app launch is attempted.
+	mainWindow = app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            "Go Python Runner v" + version,
 		Width:            1200,
 		Height:           800,
@@ -224,6 +282,13 @@ func main() {
 	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
+
+	// Window closed: cancel any still-running scripts so grpcServer.Stop's
+	// GracefulStop doesn't block waiting for long-lived bidi streams (e.g.
+	// cache_produce holding for 30s). Cancel fires async with a 3s grace
+	// window before kill, so worst-case shutdown lag drops from "as long as
+	// the slowest script" to ~3s.
+	mgr.CancelAll()
 }
 
 // wailsDialogHandler implements runner.DialogHandler using Wails native dialogs.

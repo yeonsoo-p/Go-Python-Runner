@@ -61,11 +61,14 @@ A native desktop application that orchestrates bundled Python scripts through a 
   - Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - Windows: `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"`
 - **Wails v3** — `go install github.com/wailsapp/wails/v3/cmd/wails3@latest`
+- **Go gRPC**
+  - `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`
+  - `go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`
 
 **Platform dependencies:**
 
 - **Windows:** No C toolchain required — SQLite uses the pure-Go [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) driver and Wails v3 talks to WebView2 via DLL bindings (no CGO).
-- **Linux (Ubuntu/Debian):** `sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.0-dev` — Wails v3 links GTK + webkit2gtk via CGO on Linux.
+- **Linux (Ubuntu/Debian):** `sudo apt install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev` — Wails v3 links GTK + webkit2gtk via CGO on Linux.
 
 Run `wails3 doctor` to verify your environment is ready.
 

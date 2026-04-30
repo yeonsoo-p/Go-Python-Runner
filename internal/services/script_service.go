@@ -10,7 +10,6 @@ import (
 	"go-python-runner/internal/notify"
 	"go-python-runner/internal/registry"
 
-	"github.com/pkg/browser"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -24,7 +23,7 @@ type ScriptService struct {
 	reservoir   notify.Reservoir
 	app         atomic.Pointer[application.App]
 	allowedRoot []string   // absolute, normalized roots that OpenPath will permit
-	openHook    pathOpener // injectable opener; defaults to browser.OpenFile
+	openHook    pathOpener // injectable opener; defaults to app.Browser.OpenFile once SetApp wires the app
 }
 
 // NewScriptService creates a new ScriptService. allowedRoots are absolute paths
@@ -49,14 +48,18 @@ func NewScriptService(reg *registry.Registry, reservoir notify.Reservoir, allowe
 		registry:    reg,
 		reservoir:   reservoir,
 		allowedRoot: roots,
-		openHook:    browser.OpenFile,
 	}
 }
 
 // SetApp wires the Wails app reference for emitting scripts:changed events.
 // Called after app initialization, alongside RunnerService/LogService SetApp.
+// Also sets the default OpenPath hook to app.Browser.OpenFile if a test
+// hasn't already overridden it.
 func (s *ScriptService) SetApp(app *application.App) {
 	s.app.Store(app)
+	if s.openHook == nil {
+		s.openHook = app.Browser.OpenFile
+	}
 }
 
 // NotifyChanged emits the scripts:changed Wails event so the frontend re-fetches

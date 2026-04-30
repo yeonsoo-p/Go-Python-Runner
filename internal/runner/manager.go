@@ -433,6 +433,25 @@ func (m *Manager) waitForExit(runID, scriptID string, startedAt time.Time, proc 
 	})
 }
 
+// CancelAll cancels every active run. Used at shutdown so grpc.GracefulStop
+// doesn't block on Python scripts that are happy to keep running for tens of
+// seconds (cache_produce, polling loops). Snapshots run IDs under the lock,
+// then issues cancels outside it — CancelRun reacquires the lock per call,
+// so holding mu across the whole loop would deadlock.
+func (m *Manager) CancelAll() {
+	m.mu.RLock()
+	ids := make([]string, 0, len(m.activeRuns))
+	for id := range m.activeRuns {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
+
+	for _, id := range ids {
+		// Ignore ErrRunNotActive — race with organic completion is fine.
+		_ = m.CancelRun(id)
+	}
+}
+
 // CancelRun cancels a running script. Returns ErrRunNotActive if the run
 // is not in activeRuns (already terminal, or never registered) — that
 // sentinel is filtered by CancelGroup so partial group cancels don't
